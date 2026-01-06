@@ -1,0 +1,448 @@
+import bpy
+import numpy as np
+from mathutils import Matrix, Vector
+import math
+import json
+from . import dsts_formats
+from .. import data
+
+# ----------------------------------------------------------
+# Optimization Helpers
+# ----------------------------------------------------------
+
+def get_np_dtype(dtype_str):
+    """Maps the C++ string dtype to numpy dtype."""
+    mapping = {
+        "uByte": np.uint8,
+        "sByte": np.int8,
+        "uShort": np.uint16,
+        "sShort": np.int16,
+        "uInt": np.uint32,
+        "sInt": np.int32,
+        "float": np.float32,
+        "float16": np.float16,
+    }
+    return mapping.get(dtype_str, np.float32)
+
+def extract_attribute(raw_bytes, stride, num_verts, attr):
+    """
+    Extracts a specific attribute from the interleaved binary buffer.
+    Uses attr.count to determine dimensionality (1, 2, 3, 4).
+    """
+    dtype = get_np_dtype(attr.dtype)
+    
+    # Calculate total size of this attribute (e.g., 3 floats * 4 bytes = 12 bytes)
+    component_count = attr.count 
+    attr_size = np.dtype(dtype).itemsize * component_count
+    
+    # Create a view of the whole buffer as uint8
+    byte_view = np.frombuffer(raw_bytes, dtype=np.uint8)
+    
+    # Reshape to (num_verts, stride) to isolate vertices
+    vertex_data = byte_view.reshape(num_verts, stride)
+    
+    # Slice the columns we need
+    attr_bytes = vertex_data[:, attr.offset : attr.offset + attr_size]
+    
+    # Convert bytes to actual values
+    values = np.frombuffer(attr_bytes.tobytes(), dtype=dtype)
+    
+    # Reshape to (Vertices, Components) if > 1 component
+    if component_count > 1:
+        values = values.reshape(num_verts, component_count)
+        
+    return values
+
+# ----------------------------------------------------------
+# Convert Mesh → Blender Mesh (Optimized)
+# ----------------------------------------------------------
+def import_mesh_object(bl_mesh: dsts_formats.Mesh, armature_obj, materials_dict, collection, coord_transform=Matrix.Rotation(math.radians(90), 4, 'X')):
+    
+    attributes, stride, packed = bl_mesh.pack_vertices()
+    num_verts = len(packed) // stride
+    attr_map = {a.atype: a for a in attributes}
+
+    # --- GEOMETRY ---
+    positions = extract_attribute(packed, stride, num_verts, attr_map["position"])
+    if positions.shape[1] == 4:
+        positions = positions[:, :3]
+    
+    if coord_transform:
+        if isinstance(coord_transform, Matrix):
+            mat = np.array(coord_transform)
+            positions = positions @ mat[:3, :3].T + mat[:3, 3]
+        else:
+            vecs = [coord_transform(Vector(p)) for p in positions]
+            positions = np.array(vecs, dtype=np.float32)
+
+    flat_indices = bl_mesh.get_indices()
+    faces = np.array(flat_indices, dtype=np.int32).reshape(-1, 3)
+
+    mesh_data = bpy.data.meshes.new(bl_mesh.name)
+    mesh_data.from_pydata(positions, [], faces)
+    
+    mesh_data.update(calc_edges=True)
+
+    # --- UVs ---
+    if faces.size > 0:
+        loop_v_idxs = np.zeros(len(mesh_data.loops), dtype=np.int32)
+        mesh_data.loops.foreach_get("vertex_index", loop_v_idxs)
+        
+        for uv_name in ["uv1", "uv2", "uv3"]:
+            if uv_name in attr_map:
+                uv_data = extract_attribute(packed, stride, num_verts, attr_map[uv_name])
+                uv_layer = mesh_data.uv_layers.new(name=uv_name)
+                uv_layer.data.foreach_set("uv", uv_data[loop_v_idxs].reshape(-1))
+
+    # --- VERTEX COLORS (Color Attributes) ---
+    if faces.size > 0:
+        # The loop_v_idxs array is already retrieved above for UVs, 
+        # but we check again for robustness in case UVs section is skipped.
+        if 'loop_v_idxs' not in locals():
+             loop_v_idxs = np.zeros(len(mesh_data.loops), dtype=np.int32)
+             mesh_data.loops.foreach_get("vertex_index", loop_v_idxs)
+
+        # Assuming the vertex color attribute is named 'color' in the source data.
+        if "color" in attr_map:
+            color_attr = attr_map["color"]
+            color_data = extract_attribute(packed, stride, num_verts, color_attr)
+            
+            # Ensure color data has 4 components (RGBA) for Blender, padding with alpha=1.0 if necessary
+            # Color attributes in Blender are typically 4-component (RGBA) float or byte.
+            if color_attr.count == 3:
+                # Pad with 1.0 alpha
+                alpha_channel = np.ones((num_verts, 1), dtype=color_data.dtype)
+                color_data = np.hstack((color_data, alpha_channel))
+            elif color_attr.count < 3:
+                print(f"Warning: Vertex color attribute 'color' has less than 3 components ({color_attr.count}), skipping.")
+                return obj
+
+            # Normalize uByte/uShort data to float if necessary for Blender's color layer
+            if color_data.dtype == np.uint8:
+                color_data = color_data.astype(np.float32) / 255.0
+            elif color_data.dtype == np.uint16:
+                 color_data = color_data.astype(np.float32) / 65535.0
+            
+            # Create a new color attribute on the mesh (Blender 3.x API)
+            # Setting 'color' as the attribute name. 
+            # type='FLOAT_COLOR' for float data (which we normalized to)
+            color_layer = mesh_data.color_attributes.new(
+                name='Color', 
+                type='FLOAT_COLOR', 
+                domain='CORNER' # Color is typically per-face-corner (loop)
+            )
+            
+            # The data is per vertex, but the color layer data is per loop (face corner).
+            # We map the per-vertex data to the per-loop indices.
+            # Blender expects a flattened array of RGBA values.
+            loop_colors = color_data[loop_v_idxs].reshape(-1)
+
+            # Set the data for the new color attribute
+            color_layer.data.foreach_set("color", loop_colors)
+
+    # --- NORMALS ---
+    if "normal" in attr_map:
+        normals = extract_attribute(packed, stride, num_verts, attr_map["normal"])
+        
+        if coord_transform and isinstance(coord_transform, Matrix):
+            mat_rot = np.array(coord_transform)[:3, :3]
+            normals = normals @ mat_rot.T
+            norms = np.linalg.norm(normals, axis=1, keepdims=True)
+            norms[norms == 0] = 1 
+            normals /= norms
+            
+        # 1. MANDATORY: Set all faces to Smooth.
+        # Without this, Blender treats faces as Flat, fighting the custom normals during deformation.
+        mesh_data.polygons.foreach_set("use_smooth", [True] * len(mesh_data.polygons))
+        
+        # 2. Set the custom normals (These are loop/corner normals)
+        mesh_data.normals_split_custom_set_from_vertices(normals)
+        
+        # 3. Validate the mesh
+        # This ensures the custom normal data block is properly locked and index-matched.
+        mesh_data.validate(clean_customdata=False)
+        
+        # 4. Optional: If you rely on Normal Maps, calculate tangents now
+        mesh_data.calc_tangents()
+    
+    # --- OBJECT ---
+    obj = bpy.data.objects.new(bl_mesh.name, mesh_data)
+    collection.objects.link(obj)
+
+    if bl_mesh.material and bl_mesh.material.name in materials_dict:
+        obj.data.materials.append(materials_dict[bl_mesh.material.name])
+
+    # --- WEIGHTS (Fixed for single-bone cases) ---
+    if "index" in attr_map and "weight" in attr_map and armature_obj:
+        # 1. Map Bones
+        palette_map = {}
+        if bl_mesh.matrix_palette:
+            for idx, bone_data in enumerate(bl_mesh.matrix_palette):
+                if bone_data.name in armature_obj.data.bones:
+                    palette_map[idx] = bone_data.name
+                    if bone_data.name not in obj.vertex_groups:
+                        obj.vertex_groups.new(name=bone_data.name)
+
+        # 2. Extract Data
+        idx_data = extract_attribute(packed, stride, num_verts, attr_map["index"])
+        wgt_data = extract_attribute(packed, stride, num_verts, attr_map["weight"])
+        
+        # Normalize if uByte
+        if wgt_data.dtype == np.uint8:
+            wgt_data = wgt_data.astype(np.float32) / 255.0
+
+        # --- FIX: Ensure data is always 2D (N, Comp) ---
+        # If count was 1, extract_attribute returned (N,), which causes the error
+        if idx_data.ndim == 1:
+            idx_data = idx_data.reshape(-1, 1)
+        if wgt_data.ndim == 1:
+            wgt_data = wgt_data.reshape(-1, 1)
+
+        # 3. Flatten
+        flat_weights = wgt_data.flatten()
+        flat_indices = idx_data.flatten()
+        
+        # Now shape[1] is guaranteed to exist
+        comp_count = idx_data.shape[1] 
+        flat_v_ids = np.repeat(np.arange(num_verts), comp_count)
+
+        # 4. Filter & Assign
+        mask = flat_weights > 0.001
+        
+        valid_weights = flat_weights[mask]
+        valid_bone_idxs = flat_indices[mask]
+        valid_v_ids = flat_v_ids[mask]
+
+        for i in range(len(valid_weights)):
+            palette_idx = valid_bone_idxs[i]
+            if palette_idx in palette_map:
+                bone_name = palette_map[palette_idx]
+                obj.vertex_groups[bone_name].add([int(valid_v_ids[i])], float(valid_weights[i]), 'ADD')
+    
+    # --- PARENTING ---
+    if armature_obj:
+        obj.parent = armature_obj
+        mod = obj.modifiers.new(name="Armature", type='ARMATURE')
+        mod.object = armature_obj
+
+    # --- FLAGS ---
+    mesh_data["DSTS_flag_0"] = bl_mesh.flag_0
+    mesh_data["DSTS_flag_1"] = bl_mesh.flag_1
+    mesh_data["DSTS_flag_2"] = bl_mesh.flag_2
+    mesh_data["DSTS_flag_3"] = bl_mesh.flag_3
+    mesh_data["DSTS_flag_4"] = bl_mesh.flag_4
+    mesh_data["DSTS_flag_5"] = bl_mesh.flag_5
+    mesh_data["DSTS_flag_6"] = bl_mesh.flag_6
+    mesh_data["DSTS_flag_7"] = bl_mesh.flag_7
+
+    return obj
+
+def export_mesh_object(mesh_obj, skeleton = None, coord_transform = Matrix.Rotation(math.radians(-90), 4, 'X')):
+    mesh = mesh_obj.data
+    
+    # -- GEOMETRY --
+    positions = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", positions)
+    positions = positions.reshape(-1, 3)
+
+    vertex_count = len(positions)
+
+    mat = np.array(coord_transform)
+    positions = positions @ mat[:3, :3].T + mat[:3, 3]
+
+    if vertex_count > 0xFFFF:
+        raise ValueError('Too many vertices')
+
+    indices = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("vertices", indices)
+    
+    triangle_primitive = 1
+
+    mesh_out = dsts_formats.Mesh()
+    mesh_out.set_vertex_count(vertex_count)
+    mesh_out.set_position(positions)
+    mesh_out.indices = indices
+    mesh_out.primitive = triangle_primitive
+
+    loop_index = np.empty(len(mesh.loops), dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_index)
+    _, v_index = np.unique(loop_index, return_index=True)
+
+    # -- NORMALS --
+    if mesh.has_custom_normals:
+        loop_normals = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+        mesh.loops.foreach_get("normal", loop_normals)
+        loop_normals = loop_normals.reshape(-1, 3)
+
+        vert_normals = np.zeros((len(mesh.vertices), 3), dtype=np.float32)
+
+        vert_normals[loop_index[v_index]] = loop_normals[v_index]
+
+        if coord_transform and isinstance(coord_transform, Matrix):
+            mat_rot = np.array(coord_transform)[:3, :3]
+            vert_normals = vert_normals @ mat_rot.T
+            lengths = np.linalg.norm(vert_normals, axis=1, keepdims=True)
+            lengths[lengths == 0] = 1
+            vert_normals = vert_normals / lengths  
+
+        mesh_out.set_normal(vert_normals.astype(np.float16))
+
+    # -- UVS --
+    for layer in mesh.uv_layers:
+        for n in range(1,4):
+            if f"uv{n}" == layer.name:
+                loop_uvs = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+                layer.data.foreach_get("uv", loop_uvs)
+                loop_uvs = loop_uvs.reshape(-1, 2)
+
+                vert_uvs = np.zeros((len(mesh.vertices), 2), dtype=np.float32)
+
+                vert_uvs[loop_index[v_index]] = loop_uvs[v_index]
+
+                mesh_out.set_uv(n, vert_uvs)
+
+    # -- COLORS --
+    if "Color" in mesh.color_attributes:
+        color =  mesh.color_attributes["Color"].data
+
+        loop_colors = np.empty(len(mesh.loops) * 4, dtype=np.float32)
+        color.foreach_get("color", loop_colors)
+        loop_colors = np.clip(loop_colors* 255, 0, 255).astype(np.uint8)
+        loop_colors = loop_colors.reshape(-1, 4)
+
+        vert_colors = np.zeros((len(mesh.vertices), 4), dtype=np.uint8)
+        vert_colors[loop_index[v_index]] = loop_colors[v_index]
+
+        mesh_out.set_color(vert_colors)
+
+    # -- TANGENTS --
+    if "uv1" in mesh.uv_layers:
+        # Check if all faces are tris/quads before calculating tangents
+        has_ngons = any(len(p.vertices) > 4 for p in mesh.polygons)
+        
+        if has_ngons:
+            # Triangulate the mesh temporarily for tangent calculation
+            import bmesh
+            bm = bmesh.new()
+            bm.from_mesh(mesh)
+            bmesh.ops.triangulate(bm, faces=bm.faces[:])
+            
+            # Create a temporary mesh for tangent calculation
+            temp_mesh = bpy.data.meshes.new("_temp_tangent_mesh")
+            bm.to_mesh(temp_mesh)
+            bm.free()
+            
+            temp_mesh.calc_tangents(uvmap="uv1")
+            
+            # Build mapping from original vertices to temp mesh loops
+            temp_loop_index = np.empty(len(temp_mesh.loops), dtype=np.int32)
+            temp_mesh.loops.foreach_get("vertex_index", temp_loop_index)
+            _, temp_v_index = np.unique(temp_loop_index, return_index=True)
+            
+            loop_tangents = np.empty(len(temp_mesh.loops) * 3, dtype=np.float32)
+            loop_tangent_signs = np.empty(len(temp_mesh.loops), dtype=np.float32)
+            temp_mesh.loops.foreach_get("tangent", loop_tangents)
+            temp_mesh.loops.foreach_get("bitangent_sign", loop_tangent_signs)
+            loop_tangents = loop_tangents.reshape(-1, 3)
+            
+            # Map to vertices using temp mesh indices
+            vert_tangents_3 = np.zeros((len(mesh.vertices), 3), dtype=np.float32)
+            vert_tangent_signs = np.zeros(len(mesh.vertices), dtype=np.float32)
+            vert_tangents_3[temp_loop_index[temp_v_index]] = loop_tangents[temp_v_index]
+            vert_tangent_signs[temp_loop_index[temp_v_index]] = loop_tangent_signs[temp_v_index]
+            
+            # Clean up temp mesh
+            bpy.data.meshes.remove(temp_mesh)
+            
+            if coord_transform and isinstance(coord_transform, Matrix):
+                mat_rot = np.array(coord_transform)[:3, :3]
+                vert_tangents_3 = vert_tangents_3 @ mat_rot.T
+                lengths = np.linalg.norm(vert_tangents_3, axis=1, keepdims=True)
+                lengths[lengths == 0] = 1
+                vert_tangents_3 = vert_tangents_3 / lengths
+            
+            vert_tangents = np.column_stack([vert_tangents_3, vert_tangent_signs])
+        else:
+            mesh.calc_tangents(uvmap="uv1")
+            
+            loop_tangents = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+            loop_tangent_signs = np.empty(len(mesh.loops), dtype=np.float32)
+            mesh.loops.foreach_get("tangent", loop_tangents)
+            mesh.loops.foreach_get("bitangent_sign", loop_tangent_signs)
+            loop_tangents = loop_tangents.reshape(-1, 3)
+
+            if coord_transform and isinstance(coord_transform, Matrix):
+                mat_rot = np.array(coord_transform)[:3, :3]
+                loop_tangents = loop_tangents @ mat_rot.T
+                lengths = np.linalg.norm(loop_tangents, axis=1, keepdims=True)
+                lengths[lengths == 0] = 1
+                loop_tangents = loop_tangents / lengths
+
+            loop_tangents = np.column_stack([loop_tangents, loop_tangent_signs])
+
+            vert_tangents = np.zeros((len(mesh.vertices), 4), dtype=np.float32)
+            vert_tangents[loop_index[v_index]] = loop_tangents[v_index]
+
+        mesh_out.set_tangent(vert_tangents.astype(np.float16))
+
+    # -- WEIGHTS --
+    if skeleton is not None:
+        mesh_out.matrix_palette = [b for b in skeleton.bones if b.name in mesh_obj.vertex_groups]
+        name_to_id = {b.name:i for i,b in enumerate(mesh_out.matrix_palette)}
+
+        # Limit to 4 groups per vertex (game format limitation)
+        max_groups = 4
+        groups_per_vertex = min(max([len(v.groups) for v in mesh.vertices]), max_groups)
+        
+        vert_indices = np.zeros((len(mesh_obj.data.vertices), groups_per_vertex), dtype=np.uint8)
+        vert_weights = np.zeros((len(mesh_obj.data.vertices), groups_per_vertex), dtype=np.float32)
+
+        for vi, v in enumerate(mesh_obj.data.vertices):
+            # Get all groups for this vertex, sorted by weight (descending)
+            vertex_groups = [(g.group, g.weight) for g in v.groups]
+            vertex_groups.sort(key=lambda x: x[1], reverse=True)
+            
+            # Take only the top 4 groups
+            for gi, (group_idx, weight) in enumerate(vertex_groups[:max_groups]):
+                group_name = mesh_obj.vertex_groups[group_idx].name
+                if group_name in name_to_id:
+                    vert_indices[vi, gi] = name_to_id[group_name]
+                    vert_weights[vi, gi] = weight
+            
+            # Normalize weights so they sum to 1.0 (prevents shadow bugs in game)
+            total = vert_weights[vi].sum()
+            if total > 0:
+                vert_weights[vi] /= total
+
+        mesh_out.set_index(vert_indices)
+        mesh_out.set_weight(vert_weights.astype(np.float16))
+
+    # -- ATTRIBUTES --
+    mat = mesh.materials[0]
+    g_node = next(n for n in mat.node_tree.nodes if n.type == "GROUP" and n.node_tree.name == f"DSTS_Data-{mat.name}")
+    data_node = next(n for n in g_node.node_tree.nodes if type(n) == data.material_nodes.ShaderDataNode)
+    attrs = []
+    for at in data_node.attributes:
+        attribute = dsts_formats.MeshAttribute()
+        attribute.count = at.count
+        attribute.offset = at.offset
+        attribute.atype = at.atype
+        attribute.dtype = at.dtype
+        attrs.append(attribute)
+
+    mesh_out.mesh_attributes = attrs
+    mesh_out.bytes_per_vertex = data_node.bytes_per_vertex
+    
+    # -- FLAGS --
+    mesh_out.flag_0 = mesh.get("DSTS_flag_0", True)
+    mesh_out.flag_1 = mesh.get("DSTS_flag_1", False)
+    mesh_out.flag_2 = mesh.get("DSTS_flag_2", False)
+    mesh_out.flag_3 = mesh.get("DSTS_flag_3", False)
+    mesh_out.flag_4 = mesh.get("DSTS_flag_4", False)
+    mesh_out.flag_5 = mesh.get("DSTS_flag_5", False)
+    mesh_out.flag_6 = mesh.get("DSTS_flag_6", False)
+    mesh_out.flag_7 = mesh.get("DSTS_flag_7", False)
+
+    mesh_out.name = mesh.name
+
+    return mesh_out
