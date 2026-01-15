@@ -316,7 +316,9 @@ def export_mesh_object(mesh_obj, skeleton = None, coord_transform = Matrix.Rotat
         mesh_out.set_color(vert_colors)
 
     # -- TANGENTS --
-    if "uv1" in mesh.uv_layers:
+    # Only calculate tangents if uv1 layer exists and has data
+    uv1_layer = mesh.uv_layers.get("uv1")
+    if uv1_layer is not None and len(mesh.loops) > 0:
         # Check if all faces are tris/quads before calculating tangents
         has_ngons = any(len(p.vertices) > 4 for p in mesh.polygons)
         
@@ -332,36 +334,42 @@ def export_mesh_object(mesh_obj, skeleton = None, coord_transform = Matrix.Rotat
             bm.to_mesh(temp_mesh)
             bm.free()
             
-            temp_mesh.calc_tangents(uvmap="uv1")
-            
-            # Build mapping from original vertices to temp mesh loops
-            temp_loop_index = np.empty(len(temp_mesh.loops), dtype=np.int32)
-            temp_mesh.loops.foreach_get("vertex_index", temp_loop_index)
-            _, temp_v_index = np.unique(temp_loop_index, return_index=True)
-            
-            loop_tangents = np.empty(len(temp_mesh.loops) * 3, dtype=np.float32)
-            loop_tangent_signs = np.empty(len(temp_mesh.loops), dtype=np.float32)
-            temp_mesh.loops.foreach_get("tangent", loop_tangents)
-            temp_mesh.loops.foreach_get("bitangent_sign", loop_tangent_signs)
-            loop_tangents = loop_tangents.reshape(-1, 3)
-            
-            # Map to vertices using temp mesh indices
-            vert_tangents_3 = np.zeros((len(mesh.vertices), 3), dtype=np.float32)
-            vert_tangent_signs = np.zeros(len(mesh.vertices), dtype=np.float32)
-            vert_tangents_3[temp_loop_index[temp_v_index]] = loop_tangents[temp_v_index]
-            vert_tangent_signs[temp_loop_index[temp_v_index]] = loop_tangent_signs[temp_v_index]
-            
-            # Clean up temp mesh
-            bpy.data.meshes.remove(temp_mesh)
-            
-            if coord_transform and isinstance(coord_transform, Matrix):
-                mat_rot = np.array(coord_transform)[:3, :3]
-                vert_tangents_3 = vert_tangents_3 @ mat_rot.T
-                lengths = np.linalg.norm(vert_tangents_3, axis=1, keepdims=True)
-                lengths[lengths == 0] = 1
-                vert_tangents_3 = vert_tangents_3 / lengths
-            
-            vert_tangents = np.column_stack([vert_tangents_3, vert_tangent_signs])
+            # Check if UV layer was copied to temp mesh
+            if "uv1" not in temp_mesh.uv_layers:
+                print("[DSTS] Warning: UV layer 'uv1' not found in triangulated mesh, skipping tangent calculation")
+                bpy.data.meshes.remove(temp_mesh)
+            else:
+                temp_mesh.calc_tangents(uvmap="uv1")
+                
+                # Build mapping from original vertices to temp mesh loops
+                temp_loop_index = np.empty(len(temp_mesh.loops), dtype=np.int32)
+                temp_mesh.loops.foreach_get("vertex_index", temp_loop_index)
+                _, temp_v_index = np.unique(temp_loop_index, return_index=True)
+                
+                loop_tangents = np.empty(len(temp_mesh.loops) * 3, dtype=np.float32)
+                loop_tangent_signs = np.empty(len(temp_mesh.loops), dtype=np.float32)
+                temp_mesh.loops.foreach_get("tangent", loop_tangents)
+                temp_mesh.loops.foreach_get("bitangent_sign", loop_tangent_signs)
+                loop_tangents = loop_tangents.reshape(-1, 3)
+                
+                # Map to vertices using temp mesh indices
+                vert_tangents_3 = np.zeros((len(mesh.vertices), 3), dtype=np.float32)
+                vert_tangent_signs = np.zeros(len(mesh.vertices), dtype=np.float32)
+                vert_tangents_3[temp_loop_index[temp_v_index]] = loop_tangents[temp_v_index]
+                vert_tangent_signs[temp_loop_index[temp_v_index]] = loop_tangent_signs[temp_v_index]
+                
+                # Clean up temp mesh
+                bpy.data.meshes.remove(temp_mesh)
+                
+                if coord_transform and isinstance(coord_transform, Matrix):
+                    mat_rot = np.array(coord_transform)[:3, :3]
+                    vert_tangents_3 = vert_tangents_3 @ mat_rot.T
+                    lengths = np.linalg.norm(vert_tangents_3, axis=1, keepdims=True)
+                    lengths[lengths == 0] = 1
+                    vert_tangents_3 = vert_tangents_3 / lengths
+                
+                vert_tangents = np.column_stack([vert_tangents_3, vert_tangent_signs])
+                mesh_out.set_tangent(vert_tangents.astype(np.float16))
         else:
             mesh.calc_tangents(uvmap="uv1")
             
@@ -382,8 +390,8 @@ def export_mesh_object(mesh_obj, skeleton = None, coord_transform = Matrix.Rotat
 
             vert_tangents = np.zeros((len(mesh.vertices), 4), dtype=np.float32)
             vert_tangents[loop_index[v_index]] = loop_tangents[v_index]
-
-        mesh_out.set_tangent(vert_tangents.astype(np.float16))
+            
+            mesh_out.set_tangent(vert_tangents.astype(np.float16))
 
     # -- WEIGHTS --
     if skeleton is not None:

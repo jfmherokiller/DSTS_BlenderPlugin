@@ -78,7 +78,12 @@ def import_geom(context, filepath, images_folder=None):
     # Filter out known benign warnings
     # - "float channels": known limitation, not a real error
     # - "Ibpm does not match": facial bones often have intentional scale differences
-    error_list = [e for e in error_list if "float channels" not in e.lower() and "ibpm does not match" not in e.lower()]
+    # - "light data" / "camera data": not yet implemented, but doesn't affect model import
+    error_list = [e for e in error_list if 
+                  "float channels" not in e.lower() and 
+                  "ibpm does not match" not in e.lower() and
+                  "light data" not in e.lower() and
+                  "camera data" not in e.lower()]
 
     if error_list:
         bpy.ops.wm.show_errors_window('INVOKE_DEFAULT', errors="\n\n".join(error_list))

@@ -85,11 +85,23 @@ def import_skeleton(skeleton, target_collection=None, coordinate_remap=None):
     # ---------------------------------------------------------
     # Create edit bones
     # ---------------------------------------------------------
+    # Track original name -> new name mapping for global_mats lookup
+    original_to_new_name = {}
+    
     for bone in skeleton.bones:
+        original_name = bone.name
         edit_bone = armature_data.edit_bones.new(bone.name)
         bone_map[edit_bone.name] = edit_bone
         # Ensure the name is updated in the source object for later lookups
-        bone.name = edit_bone.name 
+        bone.name = edit_bone.name
+        original_to_new_name[original_name] = edit_bone.name
+    
+    # Update global_mats keys to use new Blender names
+    updated_global_mats = {}
+    for original_name, mat in global_mats.items():
+        new_name = original_to_new_name.get(original_name, original_name)
+        updated_global_mats[new_name] = mat
+    global_mats = updated_global_mats
 
     # ---------------------------------------------------------
     # Compute head positions and children map
@@ -125,17 +137,25 @@ def import_skeleton(skeleton, target_collection=None, coordinate_remap=None):
     # Assign heads, tails, parents, and roll
     # ---------------------------------------------------------
     for bone in skeleton.bones:
+        if bone.name not in bone_map:
+            print(f"[DSTS] Warning: Bone '{bone.name}' not found in bone_map, skipping")
+            continue
+            
         edit_bone = bone_map[bone.name]
 
         if bone.parent:
-            edit_bone.parent = bone_map[bone.parent.name]
+            if bone.parent.name in bone_map:
+                edit_bone.parent = bone_map[bone.parent.name]
+            else:
+                print(f"[DSTS] Warning: Parent bone '{bone.parent.name}' not found for '{bone.name}'")
 
         # 2. Assign Head
         edit_bone.head = mathutils.Vector((0, 0, 0))
         edit_bone.tail = mathutils.Vector((0, 0, median_length))
 
-        gmat = apply_remap_matrix(global_mats[bone.name])
-        edit_bone.matrix = gmat
+        if bone.name in global_mats:
+            gmat = apply_remap_matrix(global_mats[bone.name])
+            edit_bone.matrix = gmat
 
     # Exit Edit Mode
     bpy.ops.object.mode_set(mode='OBJECT')
@@ -143,6 +163,11 @@ def import_skeleton(skeleton, target_collection=None, coordinate_remap=None):
     
     # Add custom geometry flag to Bone data (in Pose Mode/Object Mode)
     for bone in skeleton.bones:
+        # Check if bone exists in armature (may not exist if creation failed)
+        if bone.name not in armature_data.bones:
+            print(f"[DSTS] Warning: Bone '{bone.name}' not found in armature, skipping")
+            continue
+            
         blender_bone = armature_data.bones[bone.name]
         blender_bone["DSTS_geometry"] = bone.is_geometry
 
