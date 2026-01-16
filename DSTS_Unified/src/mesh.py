@@ -56,7 +56,7 @@ def extract_attribute(raw_bytes, stride, num_verts, attr):
 # ----------------------------------------------------------
 # Convert Mesh → Blender Mesh (Optimized)
 # ----------------------------------------------------------
-def import_mesh_object(bl_mesh: dsts_formats.Mesh, armature_obj, materials_dict, collection, coord_transform=Matrix.Rotation(math.radians(90), 4, 'X')):
+def import_mesh_object(bl_mesh: dsts_formats.Mesh, armature_obj, materials_dict, collection, coord_transform=Matrix.Rotation(math.radians(90), 4, 'X'), bone_name_map=None):
     
     attributes, stride, packed = bl_mesh.pack_vertices()
     num_verts = len(packed) // stride
@@ -174,14 +174,29 @@ def import_mesh_object(bl_mesh: dsts_formats.Mesh, armature_obj, materials_dict,
 
     # --- WEIGHTS (Fixed for single-bone cases) ---
     if "index" in attr_map and "weight" in attr_map and armature_obj:
-        # 1. Map Bones
+        # 1. Map Bones (use bone_name_map to handle Blender-renamed bones)
         palette_map = {}
+        missing_bones = []
         if bl_mesh.matrix_palette:
             for idx, bone_data in enumerate(bl_mesh.matrix_palette):
-                if bone_data.name in armature_obj.data.bones:
-                    palette_map[idx] = bone_data.name
-                    if bone_data.name not in obj.vertex_groups:
-                        obj.vertex_groups.new(name=bone_data.name)
+                # Get the actual Blender bone name (may have been renamed)
+                original_name = bone_data.name
+                blender_name = bone_name_map.get(original_name, original_name) if bone_name_map else original_name
+                
+                if blender_name in armature_obj.data.bones:
+                    palette_map[idx] = blender_name
+                    if blender_name not in obj.vertex_groups:
+                        obj.vertex_groups.new(name=blender_name)
+                elif original_name in armature_obj.data.bones:
+                    # Fallback to original name if mapping doesn't work
+                    palette_map[idx] = original_name
+                    if original_name not in obj.vertex_groups:
+                        obj.vertex_groups.new(name=original_name)
+                else:
+                    missing_bones.append(f"{original_name} (mapped to {blender_name})")
+        
+        if missing_bones:
+            print(f"[DSTS] Mesh '{bl_mesh.name}' - Missing bones: {missing_bones[:5]}{'...' if len(missing_bones) > 5 else ''}")
 
         # 2. Extract Data
         idx_data = extract_attribute(packed, stride, num_verts, attr_map["index"])

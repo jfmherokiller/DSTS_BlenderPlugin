@@ -85,32 +85,35 @@ def import_skeleton(skeleton, target_collection=None, coordinate_remap=None):
     # ---------------------------------------------------------
     # Create edit bones
     # ---------------------------------------------------------
-    # Track original name -> new name mapping for global_mats lookup
+    # Track original name -> new name mapping for mesh import
     original_to_new_name = {}
     
     for bone in skeleton.bones:
         original_name = bone.name
         edit_bone = armature_data.edit_bones.new(bone.name)
         bone_map[edit_bone.name] = edit_bone
+        original_to_new_name[original_name] = edit_bone.name
+        
+        # Also store with original name for global_mats lookup
+        if original_name != edit_bone.name:
+            bone_map[original_name] = edit_bone
+        
         # Ensure the name is updated in the source object for later lookups
         bone.name = edit_bone.name
-        original_to_new_name[original_name] = edit_bone.name
-    
-    # Update global_mats keys to use new Blender names
-    updated_global_mats = {}
-    for original_name, mat in global_mats.items():
-        new_name = original_to_new_name.get(original_name, original_name)
-        updated_global_mats[new_name] = mat
-    global_mats = updated_global_mats
 
     # ---------------------------------------------------------
     # Compute head positions and children map
     # ---------------------------------------------------------
+    # Build reverse mapping for global_mats lookup (new name -> original name)
+    new_to_original = {v: k for k, v in original_to_new_name.items()}
+    
     head_positions = {}
     children_map = {}
     for bone in skeleton.bones:
+        # bone.name is now the Blender name, look up original name for global_mats
+        original_name = new_to_original.get(bone.name, bone.name)
         # Apply remap to the global matrix before extracting the position
-        gmat = apply_remap_matrix(global_mats[bone.name])
+        gmat = apply_remap_matrix(global_mats[original_name])
         head_positions[bone.name] = gmat.to_translation()
         if bone.parent:
             children_map.setdefault(bone.parent.name, []).append(bone.name)
@@ -153,13 +156,20 @@ def import_skeleton(skeleton, target_collection=None, coordinate_remap=None):
         edit_bone.head = mathutils.Vector((0, 0, 0))
         edit_bone.tail = mathutils.Vector((0, 0, median_length))
 
-        if bone.name in global_mats:
-            gmat = apply_remap_matrix(global_mats[bone.name])
+        # Look up original name for global_mats
+        original_name = new_to_original.get(bone.name, bone.name)
+        if original_name in global_mats:
+            gmat = apply_remap_matrix(global_mats[original_name])
             edit_bone.matrix = gmat
 
     # Exit Edit Mode
     bpy.ops.object.mode_set(mode='OBJECT')
 
+    # Disable "Local Location" on all pose bones to fix positioning issues
+    bpy.ops.object.mode_set(mode='POSE')
+    for pose_bone in armature_obj.pose.bones:
+        pose_bone.bone.use_local_location = False
+    bpy.ops.object.mode_set(mode='OBJECT')
     
     # Add custom geometry flag to Bone data (in Pose Mode/Object Mode)
     for bone in skeleton.bones:
@@ -177,7 +187,8 @@ def import_skeleton(skeleton, target_collection=None, coordinate_remap=None):
             default=bone.is_geometry
         )
 
-    return armature_obj
+    # Return armature and name mapping for mesh import to use
+    return armature_obj, original_to_new_name
 
 def export_skeleton(skeleton_obj, coord_transform = Matrix.Rotation(math.radians(-90), 4, 'X')):
     skeleton = skeleton_obj.data

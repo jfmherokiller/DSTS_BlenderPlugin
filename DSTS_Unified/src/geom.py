@@ -32,7 +32,7 @@ def import_geom(context, filepath, images_folder=None):
     new_collection["CLUT"] = base64.b64encode(bytes(geom.clut)).decode("ascii")
 
     # Import Skeleton
-    armature_obj = skeleton.import_skeleton(geom.skeleton, new_collection, utils.unflop)
+    armature_obj, bone_name_map = skeleton.import_skeleton(geom.skeleton, new_collection, utils.unflop)
 
     # Import Materials
     blender_materials = {}
@@ -56,7 +56,8 @@ def import_geom(context, filepath, images_folder=None):
             mesh_obj, 
             armature_obj, 
             blender_materials, 
-            new_collection
+            new_collection,
+            bone_name_map=bone_name_map
         )
         #handle material vertex buffer layout
         mat = blender_materials[mesh_obj.material.name]
