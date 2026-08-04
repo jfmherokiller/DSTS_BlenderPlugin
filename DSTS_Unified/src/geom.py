@@ -13,7 +13,45 @@ from pathlib import Path
 from .anim.InterfaceHundredLine import AnimFileHundredLine
 from .anim.BinaryHundredLine import AnimFileBinary as AnimFileBinaryHundredLine
 
-def import_geom(context, filepath, images_folder=None):
+def extract_missing_textures(geom, base_path, game_dir):
+    """For every texture referenced by the geom's materials, if it isn't already
+    present in base_path (as .img/.dds/.png), pull "<name>.img" (raw DDS bytes)
+    directly out of the game's MVGL archives and write it into base_path.
+    Returns (extracted_names, missing_names) for reporting."""
+    from ..data import mvgl_archive
+    from .material import find_texture_file
+
+    archive_set = mvgl_archive.GameArchiveSet.get(game_dir)
+    if not archive_set.is_valid():
+        return [], []
+
+    os.makedirs(base_path, exist_ok=True)
+
+    tex_names = set()
+    for mat_data in geom.materials:
+        for uniform in mat_data.uniforms:
+            if uniform.uniform_type == "texture":
+                tex_names.add(uniform.value)
+
+    extracted, missing = [], []
+    for tex_name in sorted(tex_names):
+        if find_texture_file(base_path, tex_name) is not None:
+            continue  # already have it locally
+
+        data = archive_set.extract_texture(tex_name)
+        if data is None:
+            missing.append(tex_name)
+            continue
+
+        out_path = os.path.join(base_path, tex_name + ".img")
+        with open(out_path, "wb") as f:
+            f.write(data)
+        extracted.append(tex_name)
+
+    return extracted, missing
+
+
+def import_geom(context, filepath, images_folder=None, game_dir=None):
     error_state_old = dsts_formats.get_throw_errors()
     error_list_old = dsts_formats.get_error_list()
     dsts_formats.set_throw_errors(False)
@@ -41,7 +79,14 @@ def import_geom(context, filepath, images_folder=None):
         base_path = images_folder.rstrip(os.sep)
     else:
         base_path = str(Path(filepath).parent) + os.sep + "images"
-    
+
+    if game_dir:
+        extracted, missing = extract_missing_textures(geom, base_path, game_dir)
+        if extracted:
+            print(f"[DSTS] Extracted {len(extracted)} texture(s) from game files: {', '.join(extracted)}")
+        if missing:
+            print(f"[DSTS] Texture(s) not found in game archives: {', '.join(missing)}")
+
     for mat_data in geom.materials:
         mat = bpy.data.materials.new(name=mat_data.name)
         # Fix name collision handled by Blender

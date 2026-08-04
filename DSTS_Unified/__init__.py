@@ -13,12 +13,43 @@ from bpy.types import Operator
 bl_info = {
     "name": "DSTS Unified (Digimon Time Stranger)",
     "author": "Nymic_Razor, Pherakki (Animation), Combined by Assistant",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 5, 0),
     "category": "Import-Export",
     "description": "Import/Export .geom and .anim files for Digimon Time Stranger",
     "location": "File > Import/Export",
 }
+
+
+# =============================================================================
+# ADDON PREFERENCES
+# =============================================================================
+
+class DSTS_AddonPreferences(bpy.types.AddonPreferences):
+    """Stores the game install directory so texture extraction from the game's
+    own archives (app_0.dx11.mvgl / patch.dx11.mvgl / addcont_*.dx11.mvgl) can
+    find them without the user having to pre-extract textures by hand."""
+    bl_idname = __package__
+
+    game_install_dir: StringProperty(
+        name="Game Install Directory",
+        description=(
+            "Folder containing the game's .exe and 'gamedata' subfolder "
+            "(e.g. .../Digimon Story Time Stranger). Used to pull textures "
+            "directly out of the game's archives during import."
+        ),
+        subtype='DIR_PATH',
+        default=""
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "game_install_dir")
+        gamedata = os.path.join(bpy.path.abspath(self.game_install_dir), "gamedata") if self.game_install_dir else ""
+        if self.game_install_dir and not os.path.isdir(gamedata):
+            layout.label(text=f"No 'gamedata' folder found at: {gamedata}", icon='ERROR')
+        elif self.game_install_dir:
+            layout.label(text="gamedata folder found.", icon='CHECKMARK')
 
 
 # =============================================================================
@@ -50,27 +81,50 @@ class DSTS_OT_GeomImport(Operator, ImportHelper):
         default=""
     )
 
+    extract_from_game: BoolProperty(
+        name="Extract Missing Textures From Game Files",
+        description=(
+            "For any texture not already present in the images folder, pull it "
+            "directly out of the game's MVGL archives (requires Game Install "
+            "Directory to be set in the addon preferences)"
+        ),
+        default=True
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = True
         layout.use_property_decorate = False
-        
+
         layout.prop(self, "use_custom_images_path")
-        
+
         row = layout.row()
         row.enabled = self.use_custom_images_path
         row.prop(self, "images_path")
 
+        layout.separator()
+        prefs = context.preferences.addons[__package__].preferences
+        col = layout.column()
+        col.enabled = bool(prefs.game_install_dir)
+        col.prop(self, "extract_from_game")
+        if not prefs.game_install_dir:
+            layout.label(text="Set Game Install Directory in addon preferences to enable.", icon='INFO')
+
     def execute(self, context):
         from .src.geom import import_geom
-        
+
         # Determine images path
         if self.use_custom_images_path and self.images_path:
             images_folder = bpy.path.abspath(self.images_path)
         else:
             images_folder = None  # Use default (geom_folder/images)
-        
-        imported_collection = import_geom(context, self.filepath, images_folder)
+
+        game_dir = None
+        prefs = context.preferences.addons[__package__].preferences
+        if self.extract_from_game and prefs.game_install_dir:
+            game_dir = bpy.path.abspath(prefs.game_install_dir)
+
+        imported_collection = import_geom(context, self.filepath, images_folder, game_dir)
         self.report({'INFO'}, f"Imported: {imported_collection.name}")
         return {'FINISHED'}
 
@@ -862,6 +916,7 @@ def menu_func_export(self, context):
 # =============================================================================
 
 CLASSES = (
+    DSTS_AddonPreferences,
     DSTS_OT_GeomImport,
     DSTS_OT_GeomExport,
     DSTS_OT_AnimImport,
