@@ -96,7 +96,7 @@ def find_texture_file(tex_folder, tex_name):
     return None
 
 
-def get_image(tex_path, fallback_size=(1024, 1024)):
+def get_image(tex_path, fallback_size=(1024, 1024), fallback_color=(0.0, 0.0, 0.0, 1.0)):
     tex_path = bpy.path.abspath(tex_path)
 
     # Check if any existing image matches this path (even if missing on disk)
@@ -108,9 +108,23 @@ def get_image(tex_path, fallback_size=(1024, 1024)):
     if os.path.exists(tex_path):
         return bpy.data.images.load(tex_path)
 
-    # Otherwise create ONE shared placeholder for this path
+    # Otherwise create ONE shared placeholder for this path. Default fill is
+    # black, which is a harmless "no data" stand-in for most texture kinds
+    # (e.g. a black OverlayMaskSampler just reads as non-metallic/full-rough).
+    # It is NOT harmless for a normal map, though: a Normal Map node interprets
+    # (0,0,0) as the tangent-space vector (-1,-1,-1) (normalized), a wildly
+    # invalid surface normal that breaks lighting across the whole mesh (looks
+    # like a blown-out white/flat surface, since the true geometric normal is
+    # being overridden by garbage) -- callers building a normal-map input
+    # should pass fallback_color=(0.5, 0.5, 1.0, 1.0), the neutral "no bump"
+    # normal-map color, instead.
     name = os.path.basename(tex_path) or tex_path  # stable identifier
-    img = bpy.data.images.new(name=name, width=fallback_size[0], height=fallback_size[1])
+    img = bpy.data.images.new(name=name, width=fallback_size[0], height=fallback_size[1], alpha=True)
+    # `generated_color` (not a manual `.pixels` poke) is the authoritative fill
+    # for a GENERATED-source image -- Blender (re)generates the actual pixel
+    # buffer from it, so setting only `.pixels` directly is fragile and can get
+    # silently overwritten back to the black default later in the pipeline.
+    img.generated_color = fallback_color
 
     # Store the intended filepath so future requests will match this same image
     img.filepath = tex_path
@@ -151,8 +165,25 @@ def resolve_material(collection, mat, mat_data, tex_folder):
     # Create Principled BSDF inside group
     # ---------------------------------------------------------------------
     principled = g_nodes.new("ShaderNodeBsdfPrincipled")
-    if any([s in mat_data.name for s in ["eye_","MTR_line"]]):
-        #no idea how to render these, just hide for now
+    if any([s in mat_data.name for s in ["MTR_line", "outline"]]):
+        # No idea how to render these, just hide for now. "outline" specifically
+        # is an inflated/inverted-normal shell duplicating the body mesh almost
+        # 1:1 (same vertex count as the real body in chr090, for example) with
+        # no texture uniforms of its own -- it falls back to a flat white
+        # ("Color" vertex attribute defaults to (1,1,1,1)) Base Color. Without
+        # backface culling (the real in-game outline-shader technique this
+        # stands in for), its outward-facing surface sits right on top of the
+        # correctly-textured body from the camera's view and covers it
+        # entirely in solid white -- hiding it here avoids that until real
+        # outline rendering is implemented.
+        #
+        # "eye_" USED TO be in this list too ("no idea how to render these,
+        # just hide for now" predates the shader-uniform/texture-binding table
+        # being cracked). It's wrong now: eye_L/eye_R have complete, correctly-
+        # resolved texture uniforms (DiffuseColor, OverlayMaskSampler,
+        # InnerGrowAValue) same as any other material -- hiding them via
+        # Alpha=0 made real, working eye textures invisible for no reason.
+        # Removed; eyes now render through the same path as body materials.
         principled.inputs['Alpha'].default_value = 0.0
 
     g_links.new(principled.outputs["BSDF"], group_out.inputs["Shader"])
@@ -167,6 +198,17 @@ def resolve_material(collection, mat, mat_data, tex_folder):
     # Texture handling inside the group
     # ---------------------------------------------------------------------
     is_eye = re.match(".*_f[0-9]{2}(\.[0-9]{3})?$", mat_data.name)
+    # A second, simpler eye convention: materials literally named "eye_L"/
+    # "eye_R" (as opposed to the "_fNN"-suffixed convention `is_eye` above
+    # detects). These don't have OverlayNormalSampler/OverlayColorSampler3/
+    # OverlayNormalSampler3 uniforms, so the elaborate multi-layer `is_eye`
+    # compositing path doesn't apply -- but their OverlayMaskSampler texture
+    # is genuinely the pupil shape (confirmed by sampling the real texture:
+    # its UV placement lands exactly on one of several eye-shaped mask blobs
+    # in an otherwise-black texture atlas shared with other materials), not
+    # just a metal/roughness mask like it is for body materials. See the
+    # pupil-compositing block after the uniform loop below.
+    is_simple_eye = mat_data.name.startswith("eye_") and not is_eye
 
     normal_node = g_nodes.new("ShaderNodeNormalMap")
     normal_node.space = 'TANGENT'
@@ -225,6 +267,8 @@ def resolve_material(collection, mat, mat_data, tex_folder):
         g_links.new(overlay_eye_normal.outputs["Color"], normal_node.inputs["Color"])
 
     diffuse_texture_found = False
+    diffuse_tex_node = None
+    pupil_mask_output = None
 
     for uniform in mat_data.uniforms:
         if uniform.uniform_type == "texture":
@@ -235,9 +279,17 @@ def resolve_material(collection, mat, mat_data, tex_folder):
                 # Fallback to .img path for placeholder creation
                 tex_path = os.path.join(tex_folder, uniform.value + ".img")
 
+            # A missing normal-map texture must NOT fall back to get_image()'s
+            # default black placeholder -- a Normal Map node reads (0,0,0) as
+            # the invalid tangent-space vector (-1,-1,-1), which breaks
+            # lighting across the whole mesh (looks blown-out white/flat)
+            # instead of the harmless "no bump" result a neutral color gives.
+            is_normal_texture = uniform.parameter_name in ("Bumpiness", "OverlayNormalSampler3")
+            fallback_color = (0.5, 0.5, 1.0, 1.0) if is_normal_texture else (0.0, 0.0, 0.0, 1.0)
+
             tex_node = g_nodes.new("ShaderNodeTexImage")
             tex_node["unknown_0xC"] = uniform.unknown_0xC
-            tex_node.image = get_image(tex_path)
+            tex_node.image = get_image(tex_path, fallback_color=fallback_color)
             tex_node.label = "DSTS-" + uniform.parameter_name
 
             if uniform.parameter_name == "DiffuseColor":
@@ -245,6 +297,11 @@ def resolve_material(collection, mat, mat_data, tex_folder):
                 tex_node.image.colorspace_settings.name = 'sRGB'
                 if is_eye:
                     g_links.new(tex_node.outputs["Color"], overlay_eye_2.inputs["Color1"])
+                elif is_simple_eye:
+                    # Deferred: wired to Base Color after the loop, once we
+                    # know whether a pupil mask (OverlayMaskSampler) is also
+                    # present to composite on top of this base tint.
+                    diffuse_tex_node = tex_node
                 else:
                     g_links.new(tex_node.outputs["Color"], principled.inputs["Base Color"])
 
@@ -259,6 +316,12 @@ def resolve_material(collection, mat, mat_data, tex_folder):
 
                 g_links.new(sep_node.outputs["Green"], principled.inputs["Metallic"])
                 g_links.new(invert_node.outputs["Color"], principled.inputs["Roughness"])
+
+                if is_simple_eye:
+                    # For "eye_L"/"eye_R"-style materials this texture is the
+                    # pupil shape, not just a metal/rough mask (see is_simple_eye
+                    # comment above) -- composited into Base Color after the loop.
+                    pupil_mask_output = sep_node.outputs["Green"]
 
             if uniform.parameter_name == "LightPixelProj":
                 tex_node.image.colorspace_settings.name = 'sRGB'
@@ -306,6 +369,21 @@ def resolve_material(collection, mat, mat_data, tex_folder):
                 val = float_node.values.add()
                 val.value = value
 
+
+    # Simple-eye pupil compositing (see is_simple_eye above): paint a black
+    # pupil onto the diffuse base tint wherever the OverlayMaskSampler mask
+    # is set, instead of just linking the flat diffuse texture straight to
+    # Base Color.
+    if is_simple_eye and diffuse_tex_node is not None:
+        if pupil_mask_output is not None:
+            pupil_mix = g_nodes.new("ShaderNodeMixRGB")
+            pupil_mix.label = "Pupil Composite"
+            pupil_mix.inputs["Color2"].default_value = (0.0, 0.0, 0.0, 1.0)
+            g_links.new(diffuse_tex_node.outputs["Color"], pupil_mix.inputs["Color1"])
+            g_links.new(pupil_mask_output, pupil_mix.inputs["Fac"])
+            g_links.new(pupil_mix.outputs["Color"], principled.inputs["Base Color"])
+        else:
+            g_links.new(diffuse_tex_node.outputs["Color"], principled.inputs["Base Color"])
 
     # Fallback for base color
     if not diffuse_texture_found:
