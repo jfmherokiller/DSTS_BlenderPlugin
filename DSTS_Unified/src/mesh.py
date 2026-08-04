@@ -162,8 +162,11 @@ def import_mesh_object(bl_mesh: dsts_formats.Mesh, armature_obj, materials_dict,
         # This ensures the custom normal data block is properly locked and index-matched.
         mesh_data.validate(clean_customdata=False)
         
-        # 4. Optional: If you rely on Normal Maps, calculate tangents now
-        mesh_data.calc_tangents()
+        # 4. Optional: If you rely on Normal Maps, calculate tangents now.
+        # Requires a UV map to exist -- not every mesh has one (e.g. meshes
+        # with no uv1/uv2/uv3 vertex-attribute channel), so guard it.
+        if mesh_data.uv_layers:
+            mesh_data.calc_tangents()
     
     # --- OBJECT ---
     obj = bpy.data.objects.new(bl_mesh.name, mesh_data)
