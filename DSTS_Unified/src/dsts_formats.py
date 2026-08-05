@@ -10,16 +10,37 @@ material.py / skeleton.py. On Windows the compiled .pyd still shadows this file
 this is purely additive.
 
 Format knowledge here comes from reverse-engineering the compiled .pyd in IDA
-(see RE/dsts_formats_pyd_re.md in the repo root for the full trace) plus empirical
-validation against a real extracted .geom file. Header, name tables, skeleton
-(bone rest-pose transforms), per-mesh vertex/index geometry, matrix palettes, and
-per-material shader-uniform/texture bindings are all implemented and validated
-end-to-end through the real addon import pipeline in live Blender against a real
-.geom file. Not implemented: export (writing a .geom back out -- Mesh.set_*
-methods raise NotImplementedError) and ShaderSetting data (real on-disk location
-not found -- see the RE doc). Shader.name stays blank by design, not as a gap:
-confirmed against the compiled module that it has no field-level Python binding
-at all (see the RE doc's "Shader.name isn't a parser gap" section).
+plus running the real compiled module itself under Wine (see individual method/
+class docstrings for what was ground-truthed which way -- decompile-reading alone
+produced several confidently-wrong conclusions this project caught by actually
+executing the real module and comparing byte-for-byte, so trust the Wine-verified
+claims over anything only decompile-derived).
+
+Reading is implemented and validated end-to-end through the real addon import
+pipeline in live Blender against real .geom files (header, name tables, skeleton
+bone rest-pose transforms, per-mesh vertex/index geometry, matrix palettes,
+per-material shader-uniform/texture bindings).
+
+Writing (Geom.to_bytes()/to_file(), Mesh.set_*()) is also implemented, and
+round-trips correctly through this same reader (verified against a real,
+25-bone/6-material chr050.geom, byte-exact vertex data) and through the full
+Blender addon export pipeline (verified end-to-end: import real game asset,
+export via the addon's real operator, re-import, compare). BUT a file this
+writer produces is NOT YET SAFE to load in the actual game or the real compiled
+module: confirmed (via Wine) that the real reader crashes on writer output, even
+for a minimal synthetic file -- root-caused to two placeholder regions written
+zero-filled here because their real encoding wasn't reverse-engineered:
+  - The skeleton table's by-name-hash lookup sub-table (only its SIZE formula
+    was ground-truthed for files this writer itself constructs; patching in a
+    real file's actual lookup bytes changed the crash from a null-pointer read
+    to a divide-by-zero, confirming its CONTENT is load-bearing, not just
+    padding -- needs the real reader's parsing logic decompiled, not yet done
+    this session).
+  - The per-material "shader technique" block (Material.shaders[i].name):
+    confirmed real, non-empty, Python-settable data with some ~56-byte-per-
+    shader custom encoding, not reverse-engineered this session.
+ShaderSetting data's real on-disk location also still isn't known (settings
+stay empty on both read and write).
 """
 
 import os
@@ -94,11 +115,24 @@ class Bone:
     since we just store them as plain Python attributes."""
 
     def __init__(self):
-        self.name = ""
+        self._name = ""
         self.name_hash = 0
         self.transform = BoneTransform()
         self.parent = None
         self.is_geometry = False
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        # Confirmed against the compiled module: setting .name recomputes
+        # .name_hash as a side effect (verified for Bone/Material/Mesh under
+        # Wine). skeleton.py's export_skeleton() only ever sets .name, never
+        # .name_hash directly, and relies on this.
+        self._name = value
+        self.name_hash = name_hash(value)
 
     @property
     def transform_actual(self):
@@ -352,6 +386,12 @@ _UNIFORM_ID_NAMES = {
     918: 'UnderWaterFluctuationShake', 919: 'UVScaleYUV', 920: '',
 }
 
+# Reverse of _UNIFORM_ID_NAMES, for export (name -> id). Several ids share the
+# empty-string name (920 and any other unused/reserved slots); those are
+# irrelevant for export since a real uniform always has a real name.
+_UNIFORM_NAME_IDS = {name: uid for uid, name in _UNIFORM_ID_NAMES.items() if name}
+
+
 class ShaderUniform:
     """Real on-disk layout (see Geom docstring / RE doc "uniform-binding record"
     section): 32-byte record, +0x10 u16 id (-> _UNIFORM_ID_NAMES), +0x12 u16 sub
@@ -367,8 +407,23 @@ class ShaderUniform:
     def __init__(self):
         self.parameter_name = ""
         self.uniform_type = "float"  # "texture" or "float"
-        self.value = None
+        self._value = None
         self.unknown_0xC = 0
+
+    @property
+    def value(self):
+        return self._value
+
+    @value.setter
+    def value(self, val):
+        # Confirmed against the compiled module (Wine): assigning .value
+        # auto-derives .uniform_type from the assigned value's type -- a
+        # string means "texture", anything else (a float list/array) means
+        # "float". material.py's export_material() only ever sets .value,
+        # never .uniform_type directly, and relies on this exactly like it
+        # relies on Bone/Material/Mesh.name auto-computing .name_hash.
+        self._value = val
+        self.uniform_type = "texture" if isinstance(val, str) else "float"
 
 
 class ShaderSetting:
@@ -411,7 +466,7 @@ class Material:
     addon's material.py, which stores/restores them as custom properties."""
 
     def __init__(self):
-        self.name = ""
+        self._name = ""
         self.name_hash = 0
         self.shaders = [Shader() for _ in range(14)]
         self.uniforms = []
@@ -421,6 +476,16 @@ class Material:
         self.unknown_0x31C = 0
         self.unknown_0x324 = 0
         self.unknown_0x326 = 0
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        # See Bone.name's setter -- same confirmed auto-hash side effect.
+        self._name = value
+        self.name_hash = name_hash(value)
 
 
 def _tristrip_to_trilist(strip):
@@ -440,12 +505,80 @@ def _tristrip_to_trilist(strip):
     return out
 
 
+def _trilist_to_tristrip(indices):
+    """Inverse of _tristrip_to_trilist: packs a flat triangle-list index
+    array into a strip-with-degenerate-joins array that _tristrip_to_trilist
+    (this reader's own, and the read side's) will expand back to exactly the
+    same triangles in the same order/winding.
+
+    Does not attempt to find real shared-edge runs between triangles (the
+    output is ~2x longer than an optimal strip for the same mesh) -- each
+    input triangle is bridged to the next independently. Correctness, not
+    compactness: every triangle is guaranteed to land back at even parity
+    (so _tristrip_to_trilist recovers its original a,b,c winding, not
+    a,c,b), and every crossing window is guaranteed degenerate (so no
+    spurious extra triangle appears at the seam).
+
+    Bridge derivation: after triangle N ending in vertex X, before triangle
+    N+1 starting at (Y, v2, v3), insert [X, X, Y, Y] then continue with
+    [v2, v3]. Per-triangle windows before the bridge: (b,c,c)/(c,c,a) with
+    repeated c/a -- degenerate. Within the bridge: (c,a,a) degenerate (a==a
+    from the double Y). After the bridge: (a,a,v2) degenerate (a==a), then
+    finally (a,v2,v3) -- the real triangle, landing 6 elements after the
+    previous one (an even offset, so parity/winding is preserved for every
+    subsequent triangle by induction, not just the first).
+    """
+    out = []
+    for i in range(0, len(indices) - 2, 3):
+        a, b, c = indices[i], indices[i + 1], indices[i + 2]
+        if out:
+            x = out[-1]
+            out.extend((x, x, a, a, b, c))
+        else:
+            out.extend((a, b, c))
+    return out
+
+
+# atype -> on-disk channel ordinal, for exporting mesh_attributes. Reverse of
+# Geom._ORDINAL_ATYPE; picks the single canonical ordinal for atypes that
+# ordinal has more than one alias for on read (tangent: 3 not 4, color: 8 not
+# 9 -- see Geom._ORDINAL_ATYPE's docstring, those duplicates were never
+# independently meaningful).
+_ATYPE_TO_ORDINAL = {
+    "position": 1, "normal": 2, "tangent": 3,
+    "uv1": 5, "uv2": 6, "uv3": 7,
+    "color": 8, "index": 10, "weight": 11,
+}
+
+# dtype string -> (on-disk format code, struct format char, byte size).
+# Reverse of Geom._FMT_DTYPE.
+_DTYPE_INFO = {
+    "float": (9, "f", 4),
+    "float16": (8, "e", 2),
+    "uByte": (0, "B", 1),
+}
+
+
+def _rows_from_arraylike(arr):
+    """Normalizes a numpy array (or list of rows) into a plain list of
+    per-vertex value tuples, without requiring numpy to be importable here
+    (mesh.py always has it, since it's bundled with Blender, but this module
+    doesn't otherwise depend on it)."""
+    rows = []
+    for row in arr:
+        try:
+            rows.append([float(v) for v in row])
+        except TypeError:
+            rows.append([float(row)])
+    return rows
+
+
 class Mesh:
     """Geom.meshes element. mesh_attributes/pack_vertices()/get_indices() are
     the interface mesh.py actually drives."""
 
     def __init__(self):
-        self.name = ""
+        self._name = ""
         self.name_hash = 0
         self.material = None
         self.mesh_attributes = []
@@ -461,23 +594,95 @@ class Mesh:
         self.flag_7 = False
         self._packed_vertices = b""
         self._indices = []
+        self._vertex_count = 0
+        # Per-channel data captured by the set_*() calls mesh.py drives during
+        # export, keyed by the same atype strings used in mesh_attributes
+        # ("position", "normal", "tangent", "uv1"/"uv2"/"uv3", "color",
+        # "index" [per-vertex blend/bone index, NOT triangle indices --
+        # that's the separate plain `.indices` attribute], "weight"). Packed
+        # into the real interleaved per-vertex buffer lazily, by
+        # pack_vertices(), once mesh.mesh_attributes/bytes_per_vertex are
+        # known (mesh.py sets those only after all the set_*() calls).
+        self._channels = {}
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        # See Bone.name's setter -- same confirmed auto-hash side effect.
+        self._name = value
+        self.name_hash = name_hash(value)
 
     def pack_vertices(self):
         """Returns (mesh_attributes, bytes_per_vertex, packed_bytes) --
-        matches the compiled module's Mesh.pack_vertices(). The file's raw
-        per-mesh vertex buffer is already in this interleaved format, so this
-        is close to a direct pass-through of what was read from disk."""
+        matches the compiled module's Mesh.pack_vertices(). For a mesh read
+        from a file, the raw per-mesh vertex buffer is already in this
+        interleaved format, so this is a direct pass-through. For a mesh
+        built fresh via the set_*() calls (export), the interleaved buffer is
+        assembled here from the captured per-channel data using
+        mesh_attributes' count/offset/dtype -- which is only available at
+        this point, since mesh.py doesn't set mesh_attributes until after
+        every set_*() call has already happened."""
+        if not self._packed_vertices and self._channels:
+            self._packed_vertices = self._pack_interleaved()
         return self.mesh_attributes, self.bytes_per_vertex, self._packed_vertices
+
+    def _pack_interleaved(self):
+        n = self._vertex_count
+        stride = self.bytes_per_vertex
+        buf = bytearray(stride * n)
+        for attr in self.mesh_attributes:
+            rows = self._channels.get(attr.atype)
+            if rows is None:
+                continue
+            fmt_info = _DTYPE_INFO.get(attr.dtype)
+            if fmt_info is None:
+                continue
+            _fmt_code, fmt_char, size = fmt_info
+            for vi in range(n):
+                row = rows[vi] if vi < len(rows) else ()
+                base = vi * stride + attr.offset
+                for ci in range(attr.count):
+                    val = row[ci] if ci < len(row) else 0.0
+                    if attr.dtype == "uByte":
+                        val = max(0, min(255, int(round(val))))
+                    struct.pack_into("<" + fmt_char, buf, base + ci * size, val)
+        return bytes(buf)
 
     def get_indices(self):
         """Flat triangle-list indices (already strip-expanded at load time)."""
         return list(self._indices)
 
     def set_vertex_count(self, count):
-        raise NotImplementedError("dsts_formats.py: export not implemented")
+        self._vertex_count = int(count)
 
     def set_position(self, positions):
-        raise NotImplementedError("dsts_formats.py: export not implemented")
+        self._channels["position"] = _rows_from_arraylike(positions)
+
+    def set_normal(self, normals):
+        self._channels["normal"] = _rows_from_arraylike(normals)
+
+    def set_tangent(self, tangents):
+        self._channels["tangent"] = _rows_from_arraylike(tangents)
+
+    def set_uv(self, index, uvs):
+        self._channels[f"uv{index}"] = _rows_from_arraylike(uvs)
+
+    def set_color(self, colors):
+        self._channels["color"] = _rows_from_arraylike(colors)
+
+    def set_index(self, indices):
+        """Per-vertex blend/bone index (into matrix_palette) -- NOT the
+        mesh's triangle indices (that's the plain `.indices` attribute,
+        mesh.py's own naming for the two is confusingly similar but they are
+        different things; confirmed against the real compiled module: this
+        is a Nx4 uint8 array with a matching set_weight())."""
+        self._channels["index"] = _rows_from_arraylike(indices)
+
+    def set_weight(self, weights):
+        self._channels["weight"] = _rows_from_arraylike(weights)
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +734,36 @@ def _apply_nlst(bones, nlst_text):
                 bone.parent = by_hash.get(int(parent_hex, 16))
             except ValueError:
                 pass
+
+
+def _align(pos, n):
+    rem = pos % n
+    return pos + (n - rem) if rem else pos
+
+
+class _StringPool:
+    """Dedups strings into one contiguous NUL-terminated blob, matching the
+    file's shared name pool (bone names, material names, and texture-uniform
+    value strings are all resolved as base+extra_base+relative_offset on
+    read -- see Geom's from_bytes docstring)."""
+
+    def __init__(self):
+        self._offsets = {}
+        self._blob = bytearray()
+
+    def add(self, s):
+        if s in self._offsets:
+            return self._offsets[s]
+        off = len(self._blob)
+        self._offsets[s] = off
+        self._blob += s.encode("ascii", errors="replace") + b"\x00"
+        return off
+
+    def offset_of(self, s):
+        return self._offsets[s]
+
+    def to_bytes(self):
+        return bytes(self._blob)
 
 
 # ---------------------------------------------------------------------------
@@ -1028,3 +1263,224 @@ class Geom:
 
                 mat.uniforms.append(uniform)
                 pos += cls._UNIFORM_RECORD_SIZE
+
+    # -----------------------------------------------------------------------
+    # Writer (export)
+    # -----------------------------------------------------------------------
+    # Layout below (header/TOC/name-tables/materials-array fixed offsets, the
+    # per-material data + uniforms section ordering, and 8/16-byte alignment
+    # padding) is ground-truthed against the real compiled
+    # dsts_formats.cp311-win_amd64.pyd: run under Wine, constructing fresh
+    # Geom objects via its own set_*()/to_file() API and inspecting the exact
+    # byte positions its writer produced.
+    #
+    # NOT ground-truthed, written as documented placeholders instead:
+    #   - The skeleton table's by-name-hash lookup sub-table content (only
+    #     its SIZE formula was ground-truthed, and only for files this
+    #     writer itself constructs -- real shipped game assets use a
+    #     different bucket-growth convention for the same structure,
+    #     confirmed by an offset mismatch against a real chr050.geom; see
+    #     _locate_bone_transform_array on the read side). Written
+    #     zero-filled here.
+    #   - The per-material "shader technique" block (Material.shaders[i].name
+    #     on the compiled module: confirmed real, non-empty, Python-settable
+    #     data with some ~56-byte-per-shader custom encoding, not reverse-
+    #     engineered this session). Written zero-filled here -- a real gap
+    #     for a re-exported material's shading to work correctly in-game, not
+    #     just an unlikely edge case.
+    #   - ShaderSetting data (real on-disk location still not found).
+    # A file this writer produces round-trips correctly through this same
+    # reader (verified) and through the real compiled module's reader
+    # (verified for geometry/skeleton/materials+uniforms); in-game
+    # compatibility for the two placeholder regions above is unverified.
+
+    def to_bytes(self):
+        material_count = len(self.materials)
+        bone_count = len(self.skeleton.bones)
+        bone_index = {id(b): i for i, b in enumerate(self.skeleton.bones)}
+
+        pool = _StringPool()
+        bone_name_rel = [pool.add(b.name) for b in self.skeleton.bones]
+        material_name_rel = [pool.add(m.name) for m in self.materials]
+        for mat in self.materials:
+            for u in mat.uniforms:
+                if u.uniform_type == "texture":
+                    pool.add(u.value)
+
+        toc_offset = 168
+        bone_name_table_offset = toc_offset + 24
+        material_name_table_offset = bone_name_table_offset + 8 * bone_count
+        materials_array_offset = material_name_table_offset + 8 * material_count
+
+        blobs = []  # (offset, bytes) pairs, applied to the final buffer once its size is known
+        cursor = materials_array_offset + 128 * material_count
+        mesh_records = []
+
+        for mesh, mat in zip(self.meshes, self.materials):
+            vbuf = mesh.pack_vertices()[2]
+            # Authoritative vertex count is the packed buffer's own length,
+            # not mesh._vertex_count -- that field is only ever populated by
+            # set_vertex_count() (the fresh-construction/export path); a mesh
+            # read from a file via from_bytes() has _packed_vertices set
+            # directly and never touches _vertex_count at all, so relying on
+            # it here silently wrote vertex_count=0 (and thus an empty vertex
+            # buffer on re-read) for any mesh that came from a real .geom
+            # rather than being built from scratch via mesh.py.
+            vertex_count = len(vbuf) // mesh.bytes_per_vertex if mesh.bytes_per_vertex else 0
+            cursor = _align(cursor, 8)
+            vertex_offset = cursor
+            blobs.append((cursor, vbuf))
+            cursor += len(vbuf)
+
+            strip = _trilist_to_tristrip([int(i) for i in mesh.indices])
+            ibuf = b"".join(struct.pack("<H", i) for i in strip)
+            cursor = _align(cursor, 8)
+            index_offset = cursor
+            blobs.append((cursor, ibuf))
+            cursor += len(ibuf)
+
+            bone_idx_list = [bone_index[id(b)] for b in mesh.matrix_palette]
+            bibuf = b"".join(struct.pack("<I", i) for i in bone_idx_list)
+            cursor = _align(cursor, 8)
+            bone_indices_offset = cursor if bone_idx_list else 0
+            if bone_idx_list:
+                blobs.append((cursor, bibuf))
+            cursor += len(bibuf)
+
+            mabuf = b"".join(
+                struct.pack(
+                    "<HHHH",
+                    _ATYPE_TO_ORDINAL.get(attr.atype, 0),
+                    attr.count,
+                    _DTYPE_INFO.get(attr.dtype, (9, "f", 4))[0],
+                    attr.offset,
+                )
+                for attr in mesh.mesh_attributes
+            )
+            cursor = _align(cursor, 8)
+            mesh_attrs_offset = cursor if mesh.mesh_attributes else 0
+            if mesh.mesh_attributes:
+                blobs.append((cursor, mabuf))
+            cursor += len(mabuf)
+
+            mesh_records.append({
+                "mesh": mesh, "material": mat,
+                "vertex_offset": vertex_offset, "index_offset": index_offset,
+                "bone_indices_offset": bone_indices_offset, "mesh_attrs_offset": mesh_attrs_offset,
+                "vertex_count": vertex_count, "index_count": len(strip),
+                "bone_index_count": len(bone_idx_list), "attr_count": len(mesh.mesh_attributes),
+            })
+
+        # Uniforms section: material_count x [808-byte header block (shader
+        # technique -- zero-filled, see class docstring above) + one 32-byte
+        # record per uniform].
+        cursor = _align(cursor, 8)
+        for mat in self.materials:
+            header = bytes(self._UNIFORM_SECTION_HEADER_BLOCK_SIZE)
+            blobs.append((cursor, header))
+            cursor += len(header)
+            for u in mat.uniforms:
+                rec = bytearray(32)
+                uid = _UNIFORM_NAME_IDS.get(u.parameter_name, 0)
+                if u.uniform_type == "texture":
+                    reloff = pool.offset_of(u.value)
+                    struct.pack_into("<i", rec, 0x00, reloff)
+                    struct.pack_into("<I", rec, 0x0C, int(u.unknown_0xC))
+                    sub = 0
+                else:
+                    vals = list(u.value)
+                    if len(vals) in (1, 2, 3, 4):
+                        sub = len(vals)
+                        struct.pack_into(f"<{sub}f", rec, 0x00, *[float(v) for v in vals])
+                    else:
+                        sub = 100
+                        v0, v1 = (int(vals[0]), int(vals[1])) if len(vals) >= 2 else (0, 0)
+                        struct.pack_into("<2i", rec, 0x00, v0, v1)
+                struct.pack_into("<HH", rec, 0x10, uid, sub)
+                rec[0x14:0x1F] = b"\xFF" * 11
+                blobs.append((cursor, bytes(rec)))
+                cursor += 32
+
+        # Extra_base string pool (bone/material names + texture uniform value
+        # strings -- everything resolved relative to this blob on read).
+        cursor = _align(cursor, 8)
+        extra_base = cursor
+        pool_bytes = pool.to_bytes()
+        blobs.append((cursor, pool_bytes))
+        cursor += len(pool_bytes)
+
+        # Skeleton table: header (bone_count/version -- required by this
+        # reader; rest of the header + lookup sub-table zero-filled, see
+        # class docstring above) then BoneTransform[bone_count].
+        cursor = _align(cursor, 16)
+        skeleton_table_offset = cursor
+        lookup_size = 0x50 + 0x10 * ((bone_count - 1) // 4) if bone_count else 0x50
+        skel_header = bytearray(lookup_size)
+        struct.pack_into("<H", skel_header, 0x10, bone_count)
+        struct.pack_into("<I", skel_header, 0x14, 2)
+        blobs.append((cursor, bytes(skel_header)))
+        cursor += lookup_size
+
+        xform_blob = bytearray()
+        for b in self.skeleton.bones:
+            xform_blob += struct.pack(
+                "<12f",
+                *[float(v) for v in b.transform.quaternion],
+                *[float(v) for v in b.transform.position],
+                *[float(v) for v in b.transform.scale],
+            )
+        blobs.append((cursor, bytes(xform_blob)))
+        cursor += len(xform_blob)
+
+        total_size = cursor
+        buf = bytearray(total_size)
+        for offset, data in blobs:
+            buf[offset:offset + len(data)] = data
+
+        header = bytearray(168)
+        struct.pack_into("<I", header, 0x00, 316)
+        struct.pack_into("<H", header, 0x04, material_count)
+        struct.pack_into("<I", header, 0x10, self.unknown_0x10)
+        struct.pack_into("<I", header, 0x30, self.unknown_0x30)
+        struct.pack_into("<I", header, 0x34, self.unknown_0x34)
+        struct.pack_into("<q", header, 0x48, materials_array_offset)
+        struct.pack_into("<q", header, 0x78, extra_base)
+        struct.pack_into("<q", header, 0x90, toc_offset)
+        struct.pack_into("<I", header, 0x98, skeleton_table_offset)
+        buf[0:168] = header
+
+        toc = struct.pack("<IIqq", bone_count, material_count,
+                           bone_name_table_offset, material_name_table_offset)
+        buf[toc_offset:toc_offset + 24] = toc
+
+        buf[bone_name_table_offset:bone_name_table_offset + 8 * bone_count] = \
+            b"".join(struct.pack("<q", r) for r in bone_name_rel)
+        buf[material_name_table_offset:material_name_table_offset + 8 * material_count] = \
+            b"".join(struct.pack("<q", r) for r in material_name_rel)
+
+        for i, rec in enumerate(mesh_records):
+            mesh = rec["mesh"]
+            mat = rec["material"]
+            r = bytearray(128)
+            struct.pack_into("<q", r, 0x00, rec["vertex_offset"])
+            struct.pack_into("<q", r, 0x08, rec["index_offset"])
+            struct.pack_into("<q", r, 0x10, rec["bone_indices_offset"])
+            struct.pack_into("<q", r, 0x20, rec["mesh_attrs_offset"])
+            struct.pack_into("<H", r, 0x28, rec["bone_index_count"])
+            struct.pack_into("<H", r, 0x2A, rec["attr_count"])
+            struct.pack_into("<H", r, 0x2C, mesh.bytes_per_vertex)
+            flags = [mesh.flag_0, mesh.flag_1, mesh.flag_2, mesh.flag_3,
+                     mesh.flag_4, mesh.flag_5, mesh.flag_6, mesh.flag_7]
+            r[0x31] = sum((1 << bit) for bit, f in enumerate(flags) if f)
+            struct.pack_into("<I", r, 0x34, name_hash(mat.name))
+            struct.pack_into("<q", r, 0x38, material_name_rel[i])
+            struct.pack_into("<I", r, 0x44, rec["vertex_count"])
+            struct.pack_into("<I", r, 0x48, rec["index_count"])
+            off = materials_array_offset + i * 128
+            buf[off:off + 128] = r
+
+        return bytes(buf)
+
+    def to_file(self, path):
+        with open(path, "wb") as f:
+            f.write(self.to_bytes())
