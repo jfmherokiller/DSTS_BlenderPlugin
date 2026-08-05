@@ -27,20 +27,46 @@ round-trips correctly through this same reader (verified against a real,
 Blender addon export pipeline (verified end-to-end: import real game asset,
 export via the addon's real operator, re-import, compare). BUT a file this
 writer produces is NOT YET SAFE to load in the actual game or the real compiled
-module: confirmed (via Wine) that the real reader crashes on writer output, even
-for a minimal synthetic file -- root-caused to two placeholder regions written
-zero-filled here because their real encoding wasn't reverse-engineered:
-  - The skeleton table's by-name-hash lookup sub-table (only its SIZE formula
-    was ground-truthed for files this writer itself constructs; patching in a
-    real file's actual lookup bytes changed the crash from a null-pointer read
-    to a divide-by-zero, confirming its CONTENT is load-bearing, not just
-    padding -- needs the real reader's parsing logic decompiled, not yet done
-    this session).
-  - The per-material "shader technique" block (Material.shaders[i].name):
-    confirmed real, non-empty, Python-settable data with some ~56-byte-per-
-    shader custom encoding, not reverse-engineered this session.
-ShaderSetting data's real on-disk location also still isn't known (settings
-stay empty on both read and write).
+module: confirmed (via Wine) that the real reader still crashes on writer
+output, even for a minimal synthetic file.
+
+The skeleton table's by-name-hash lookup sub-table -- flagged in an earlier
+pass as "only its SIZE formula was ground-truthed, content zero-filled" -- has
+since been fully reverse-engineered by decompiling the real reader itself
+(Skeleton::ReadFromStream, not just the writer) and cross-validating every
+field against real Wine-captured bytes. It is NOT a hash table at all: it's a
+64-byte header (+0x10 u16 bone_count, +0x14 u32 version==2, +0x18/+0x1C/+0x20
+u32 relative offsets to three sub-arrays -- see _write_skeleton_table's
+implementation comment for the exact formulas) followed by a fixed-position
+(header+0x40) array of (u16 bone_index, u16 parent_index-or-0x7FFF) pairs --
+the real on-disk parent-hierarchy encoding, previously thought to only live in
+the companion .nlst. This is implemented and produces a correct parent chain
+when read back (verified). A second, separate "Geom-level" duplicate
+BoneTransform array (header +0x0C count, +0x68 absolute position),
+independently read and cross-checked by Geom::ParseFromStream against the
+Skeleton's own copy, was also discovered and is implemented (a byte-identical
+duplicate).
+
+Both of those were confirmed via Wine to get the real reader measurably
+further (each fix moved the crash to a distinct, later address in the real
+binary) before hitting the CURRENT blocker: once real parent links are
+present, the real reader computes each bone's composed world-space transform
+(Bone-local-matrix, multiplied by the parent's own composed matrix when a
+parent exists) and unconditionally inverts it -- and prints "Matrix is
+singular and cannot be inverted!" for nearly every bone before crashing. The
+per-bone quaternion/position/scale data going in is confirmed valid (a
+rotation+unit-scale+translation matrix is never singular), so this is most
+likely an ordering/caching requirement in how the real function expects
+composed parent transforms to already be available when a child is processed,
+not a data-correctness problem -- not yet root-caused this session (next step:
+decompile the callers of sub_1800174C0/sub_180014EA0 in
+Geom_ParseFromStream to find what supplies the "already composed" parent
+matrix and how it's populated/ordered).
+
+The per-material "shader technique" block (Material.shaders[i].name):
+confirmed real, non-empty, Python-settable data with some ~56-byte-per-shader
+custom encoding, not reverse-engineered. ShaderSetting data's real on-disk
+location also still isn't known (settings stay empty on both read and write).
 """
 
 import os
@@ -1409,28 +1435,89 @@ class Geom:
         blobs.append((cursor, pool_bytes))
         cursor += len(pool_bytes)
 
-        # Skeleton table: header (bone_count/version -- required by this
-        # reader; rest of the header + lookup sub-table zero-filled, see
-        # class docstring above) then BoneTransform[bone_count].
+        # Skeleton table. Ground-truthed by decompiling the real compiled
+        # module's actual Skeleton::ReadFromStream (not just the writer this
+        # time -- see _locate_bone_transform_array's docstring for how the
+        # earlier scan-based read fallback was discovered to be necessary in
+        # the first place) and cross-validating every field against real
+        # Wine-captured bytes byte-for-byte. Real 64-byte header layout:
+        #   +0x10 u16  bone_count
+        #   +0x14 u32  version, must == 2
+        #   +0x18 u32  xform_rel   -> xform_base = skeleton_table_offset + xform_rel + 24
+        #   +0x1C u32  v27_rel     -> v27_pos    = skeleton_table_offset + v27_rel + 28
+        #   +0x20 u32  v15_rel     -> v15_pos    = skeleton_table_offset + v15_rel + 32
+        #   +0x3C u32  v12_count   (== bone_count)
+        #   all other bytes: read into locals the real function never uses
+        #   again -- confirmed safe to leave as zero.
+        # v12 array @ skeleton_table_offset+0x40 (fixed, read sequentially
+        # right after the header, no seek): v12_count x 4 bytes, each a
+        # (u16 bone_index, u16 parent_bone_index) pair -- the REAL on-disk
+        # parent-hierarchy encoding (0x7FFF is the "no parent" sentinel).
+        # This is what the companion .nlst-based parent lookup was covering
+        # for on read (a real file's own encoding here, once understood,
+        # makes the companion file redundant but doesn't conflict with it).
+        # v27 array @ v27_pos: bone_count x u16, an index into v12 for each
+        # iteration step -- the identity mapping [0..bone_count) is valid,
+        # verified against real Wine output (a real file's v27 encodes some
+        # bucket/hash order instead, but the reader doesn't validate that
+        # it's actually hash-consistent, just uses it as a lookup).
+        # v15 array @ v15_pos: bone_count x u32, per-bone name_hash.
         cursor = _align(cursor, 16)
         skeleton_table_offset = cursor
-        lookup_size = 0x50 + 0x10 * ((bone_count - 1) // 4) if bone_count else 0x50
-        skel_header = bytearray(lookup_size)
+
+        header_size = 0x40
+        v12_pos_rel = header_size  # relative to skeleton_table_offset, fixed
+        v12_size = bone_count * 4
+        xform_rel_pos = _align(v12_pos_rel + v12_size, 4)
+        xform_size = bone_count * 48
+        v27_rel_pos = _align(xform_rel_pos + xform_size, 2)
+        v27_size = bone_count * 2
+        v15_rel_pos = _align(v27_rel_pos + v27_size, 4)
+        v15_size = bone_count * 4
+        skel_table_total = v15_rel_pos + v15_size
+
+        skel_header = bytearray(header_size)
         struct.pack_into("<H", skel_header, 0x10, bone_count)
         struct.pack_into("<I", skel_header, 0x14, 2)
-        blobs.append((cursor, bytes(skel_header)))
-        cursor += lookup_size
+        struct.pack_into("<I", skel_header, 0x18, xform_rel_pos - 24)
+        struct.pack_into("<I", skel_header, 0x1C, v27_rel_pos - 28)
+        struct.pack_into("<I", skel_header, 0x20, v15_rel_pos - 32)
+        struct.pack_into("<I", skel_header, 0x3C, bone_count)
+        blobs.append((skeleton_table_offset, bytes(skel_header)))
 
-        xform_blob = bytearray()
-        for b in self.skeleton.bones:
-            xform_blob += struct.pack(
-                "<12f",
+        v12 = bytearray(v12_size)
+        v15 = bytearray(v15_size)
+        xform_blob = bytearray(xform_size)
+        for i, b in enumerate(self.skeleton.bones):
+            parent_idx = bone_index[id(b.parent)] if b.parent is not None else 0x7FFF
+            struct.pack_into("<HH", v12, i * 4, i, parent_idx)
+            struct.pack_into("<I", v15, i * 4, b.name_hash & 0xFFFFFFFF)
+            struct.pack_into(
+                "<12f", xform_blob, i * 48,
                 *[float(v) for v in b.transform.quaternion],
                 *[float(v) for v in b.transform.position],
                 *[float(v) for v in b.transform.scale],
             )
-        blobs.append((cursor, bytes(xform_blob)))
-        cursor += len(xform_blob)
+        v27 = b"".join(struct.pack("<H", i) for i in range(bone_count))
+
+        blobs.append((skeleton_table_offset + v12_pos_rel, bytes(v12)))
+        blobs.append((skeleton_table_offset + xform_rel_pos, bytes(xform_blob)))
+        blobs.append((skeleton_table_offset + v27_rel_pos, v27))
+        blobs.append((skeleton_table_offset + v15_rel_pos, bytes(v15)))
+        cursor = skeleton_table_offset + skel_table_total
+
+        # Geom-level header carries its OWN separate copy of the
+        # BoneTransform array (header +0x0C u16 count, +0x68 i64 absolute
+        # position) that Geom::ParseFromStream reads independently of
+        # Skeleton::ReadFromStream and cross-checks against it (count must
+        # match, then a per-component float-equality loop, tolerance
+        # 0.0001) -- confirmed by decompiling Geom_ParseFromStream itself
+        # (not just the writer, and not just Skeleton::ReadFromStream) after
+        # a real crash showed this second, previously-undiscovered read.
+        # Simplest correct fix: write byte-identical duplicate content.
+        second_xform_pos = _align(cursor, 8)
+        blobs.append((second_xform_pos, bytes(xform_blob)))
+        cursor = second_xform_pos + len(xform_blob)
 
         total_size = cursor
         buf = bytearray(total_size)
@@ -1440,10 +1527,12 @@ class Geom:
         header = bytearray(168)
         struct.pack_into("<I", header, 0x00, 316)
         struct.pack_into("<H", header, 0x04, material_count)
+        struct.pack_into("<H", header, 0x0C, bone_count)
         struct.pack_into("<I", header, 0x10, self.unknown_0x10)
         struct.pack_into("<I", header, 0x30, self.unknown_0x30)
         struct.pack_into("<I", header, 0x34, self.unknown_0x34)
         struct.pack_into("<q", header, 0x48, materials_array_offset)
+        struct.pack_into("<q", header, 0x68, second_xform_pos)
         struct.pack_into("<q", header, 0x78, extra_base)
         struct.pack_into("<q", header, 0x90, toc_offset)
         struct.pack_into("<I", header, 0x98, skeleton_table_offset)
