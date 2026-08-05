@@ -479,10 +479,15 @@ def export_image_as_png(image, output_path):
     """
     Export a Blender image to PNG format.
     """
-    # Store original settings
+    # Store original settings. Images loaded straight from a raw DDS/.img file
+    # (Blender can read DDS but has no matching file_format enum identifier for
+    # it) report a file_format value Blender itself can't re-assign -- reading
+    # it back here already emits an RNA warning and yields ''. Restoring that
+    # in the finally block would raise and mask an otherwise-successful save,
+    # so the restore is best-effort only.
     original_path = image.filepath_raw
     original_format = image.file_format
-    
+
     try:
         # Set up for PNG export
         image.filepath_raw = output_path
@@ -491,6 +496,9 @@ def export_image_as_png(image, output_path):
     finally:
         # Restore original settings
         image.filepath_raw = original_path
-        image.file_format = original_format
-    
+        try:
+            image.file_format = original_format
+        except Exception:
+            pass
+
     return True

@@ -561,26 +561,39 @@ class Geom:
         skeleton table (@ base+skeleton_table_offset):
           +0x10 u16  bone_count
           +0x14 u32  version (== 2 in observed files)
-          +0x30      NOT bone transforms -- a separate fixed-size (0xC0 byte / 192
-                     byte) sub-table of small incrementing uint16 pairs (looks like a
-                     hash-bucket/lookup structure for by-hash bone search; never
-                     decoded, not needed since we resolve bones by name via the
-                     companion .nlst instead). A previous version of this reader
-                     wrongly treated this region as BoneTransform[0..3] and, seeing
-                     zero-quaternion/NaN garbage there, silently substituted identity
-                     -- which corrupted every bone descending from the real root
-                     chain (their true parent-relative offsets were discarded).
-          +0xF0      BoneTransform[bone_count] REAL start, 48 bytes each (quaternion/
-                     position/scale). Empirically confirmed exactly bone_count (37 in
-                     chr090) unit-length-quaternion, sane-position/unit-scale entries
-                     with zero exceptions once read from the correct base -- bone i's
-                     transform corresponds to bone_names[i] (index-aligned with the
-                     bone name list, verified against a real chr090.nlst which lists
-                     bones in the identical order). Parent-index/is_geometry encoding
-                     elsewhere in this table was not cracked this session; instead, if
-                     a companion .nlst file is found next to the input .geom (same
-                     basename, extracted by the game alongside every model), it's
-                     used for parent/is_geometry -- see _apply_nlst().
+          +0x30      NOT bone transforms -- a by-name-hash lookup sub-table (small
+                     incrementing uint16 pairs, looks like a hash-bucket structure
+                     for by-hash bone search) whose SIZE SCALES WITH bone_count in
+                     4-bone buckets, growing by 16 bytes per bucket. Never decoded
+                     internally, not needed since we resolve bones by name via the
+                     companion .nlst instead. An earlier version of this reader
+                     assumed a fixed +0xF0 gap to BoneTransform[0] here -- that was
+                     only ever coincidentally close for the specific bone counts
+                     spot-checked at the time; for most bone counts it silently read
+                     one field-group off (each bone's *position* landing in the
+                     *quaternion* slot and so on), and the misread bytes still
+                     happened to pass the degenerate-quaternion guard below, so it
+                     never crashed or looked obviously wrong.
+          +0x50 + 0x10*((bone_count-1)//4)   BoneTransform[bone_count] REAL start,
+                     48 bytes each (quaternion/position/scale, x,y,z,w order, no
+                     compression -- confirmed by round-tripping known values through
+                     the real compiled dsts_formats.cp311-win_amd64.pyd under Wine).
+                     Formula ground-truthed two ways: (1) constructing fresh Geom
+                     objects with bone counts 2..65 via the compiled module's own
+                     set_*()/to_file() API and measuring exactly where each
+                     BoneTransform array landed (18 clean data points); (2) reading
+                     a real chr050.geom's geom.skeleton.bones[i].transform directly
+                     via the compiled module's own Python getters (bypassing all
+                     offset math) and confirming every one of its 25 bones' data
+                     sits at exactly this formula's offset -- unit-quaternion
+                     identity rotations with sane, bilaterally-symmetric positions,
+                     zero exceptions. Bone i's transform corresponds to
+                     bone_names[i] (index-aligned with the bone name list). Parent-
+                     index/is_geometry encoding elsewhere in this table was not
+                     cracked; instead, if a companion .nlst file is found next to
+                     the input .geom (same basename, extracted by the game alongside
+                     every model), it's used for parent/is_geometry -- see
+                     _apply_nlst().
 
         TOC (24 bytes @ base+toc_offset):
           +0x00 u32  count_a  (bone-name count)
@@ -708,19 +721,74 @@ class Geom:
 
         return geom
 
-    @staticmethod
-    def _read_skeleton_bones(r, base_offset, skeleton_table_rel, bone_names):
+    # Widest plausible span, relative to the skeleton table, that the by-name-
+    # hash lookup sub-table (see _locate_bone_transform_array) could occupy
+    # before BoneTransform[0] starts.
+    _SKELETON_LOOKUP_SCAN_MIN = 0x30
+    _SKELETON_LOOKUP_SCAN_MAX = 0x500
+    _SKELETON_LOOKUP_SCAN_STEP = 8
+
+    @classmethod
+    def _locate_bone_transform_array(cls, r, table_pos, bone_count):
+        """Finds where BoneTransform[0] actually starts, by scanning for the
+        offset at which bone_count consecutive 48-byte (quat/pos/scale)
+        blocks all look like valid transforms, rather than assuming a fixed
+        or formula-derived gap after the table header.
+
+        The region between the table header (+0x10 bone_count, +0x14 version)
+        and BoneTransform[0] is a by-name-hash lookup table (small
+        incrementing uint16 pairs) whose size is NOT a simple function of
+        bone_count alone -- ground-truthed two ways under Wine against the
+        real compiled dsts_formats.cp311-win_amd64.pyd: (1) constructing
+        fresh Geom objects with bone counts 2..65 via its own set_*()/
+        to_file() API showed a clean bone_count-bucketed formula (+0x50,
+        growing +0x10 every 4 bones); (2) but reading a real, shipped
+        chr050.geom (25 bones) via the compiled module's own Python getters
+        (ground truth, no offset math) showed its true BoneTransform start
+        does NOT match that formula's prediction for 25 bones -- confirmed
+        by locating one bone's exact known position.x bytes directly in the
+        file. I.e. the game's own asset pipeline and this reverse-engineered
+        community module's write path use different bucket-growth constants
+        for the same structure. A fixed formula can't cover both, so this
+        scans instead: exactly one offset in the plausible range passed the
+        validity check for chr050 (unit-magnitude quaternion, sane scale,
+        no NaN, for all 25 bones simultaneously) -- the same offset the
+        direct byte search independently confirmed.
+
+        Falls back to the community-module bucket formula if no offset in
+        the scanned range validates for every bone (e.g. a file whose real
+        transforms are themselves degenerate); the per-bone NaN/zero guard
+        below still protects Blender either way.
+        """
+        for rel in range(cls._SKELETON_LOOKUP_SCAN_MIN, cls._SKELETON_LOOKUP_SCAN_MAX, cls._SKELETON_LOOKUP_SCAN_STEP):
+            base = table_pos + rel
+            if base + 48 * bone_count > len(r.data):
+                break
+            valid = True
+            for i in range(bone_count):
+                off = base + i * 48
+                quat = struct.unpack_from("<4f", r.data, off)
+                scale = struct.unpack_from("<4f", r.data, off + 32)
+                if any(v != v for v in quat + scale):
+                    valid = False
+                    break
+                mag = sum(v * v for v in quat) ** 0.5
+                if abs(mag - 1.0) >= 0.02 or not (0.001 < abs(scale[0]) < 1000):
+                    valid = False
+                    break
+            if valid:
+                return base
+
+        # Best-effort fallback: community-module bucket formula (correct for
+        # files written by dsts_formats.cp311-win_amd64.pyd itself; not
+        # necessarily correct for real shipped game assets).
+        return table_pos + 0x50 + 0x10 * ((bone_count - 1) // 4)
+
+    @classmethod
+    def _read_skeleton_bones(cls, r, base_offset, skeleton_table_rel, bone_names):
         table_pos = base_offset + skeleton_table_rel
         bone_count = r.u16(table_pos + 0x10)
-        # NOT +0x30 -- that lands inside a separate, unrelated 0xC0-byte
-        # lookup sub-table (see the Geom docstring). The real BoneTransform
-        # array starts 0xC0 bytes later. Verified: with this base, all
-        # bone_count entries have a unit-length quaternion and unit scale --
-        # zero exceptions -- whereas +0x30 produced 4 garbage-looking leading
-        # entries that a previous version of this function guarded to
-        # identity, silently discarding their true parent-relative offsets
-        # and corrupting the whole descendant chain.
-        xform_base = table_pos + 0xF0
+        xform_base = cls._locate_bone_transform_array(r, table_pos, bone_count)
 
         bones = []
         for i in range(bone_count):
