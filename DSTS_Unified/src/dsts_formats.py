@@ -133,18 +133,38 @@ part is unchanged, and matches the compiled module's own Python surface
 it). What IS fixed: this writer now finds the section via header +0x50 (see
 above) instead of a heuristic, and Material._read_uniforms_section() /
 Geom.to_bytes() capture and reuse a read material's original 808-byte block
-verbatim (patching only the name_hash) instead of discarding it -- so
-importing a real asset, editing meshes/skeleton/materials-by-name, and
-re-exporting now preserves each material's real in-game shading data, which
-previously silently reverted to zero-filled (effectively broken) on every
-export regardless of whether the material was actually touched. Verified:
-write -> read back with this module's own reader -> rename the material ->
-write again -> the technique block's bytes past the first 4 are byte-
-identical between the two writes, and the *real compiled* reader resolves
-the renamed material's name correctly from the second file.
+verbatim (patching only name_hash and the two count bytes below) instead of
+discarding it -- so importing a real asset, editing meshes/skeleton/
+materials-by-name, and re-exporting now preserves each material's real
+in-game shading data, which previously silently reverted to zero-filled
+(effectively broken) on every export regardless of whether the material was
+actually touched. Verified: write -> read back with this module's own
+reader -> rename the material -> write again -> the technique block's bytes
+past the first 4 are byte-identical between the two writes, and the *real
+compiled* reader resolves the renamed material's name correctly from the
+second file.
 
-ShaderSetting data's real on-disk location also still isn't known (settings
-stay empty on both read and write).
+ShaderSetting's real on-disk location -- previously unknown, settings always
+empty on both read and write -- was found this session too: settings live in
+the EXACT SAME flat array of 32-byte records as ShaderUniform, right after
+each material's technique block, indistinguishable in position/size from a
+uniform record; only the record's `sub`-position field disambiguates them
+(a uniform shape tag 0-4, or -- for a setting -- anything else, in which
+case the record's 16-byte value is raw bytes rather than floats). This
+module's own reader previously (wrongly) treated every non-1..4 `sub` value
+as a made-up, never-verified "sub=100 2x int32 uniform" convention, silently
+corrupting every real setting into a bogus uniform. See the ShaderSetting
+class docstring for the full trace. A second, related bug was needed to
+actually get the compiled reader to expose either kind of record at all:
+the technique block's bytes at +0x320/+0x321 (u8 each) are uniform_count/
+setting_count for the records that follow -- confirmed by writing a file
+with structurally-correct uniform+setting records but these two bytes left
+at 0 (this writer's previous behavior) and finding the real reader silently
+reported 0 of each, no error; patching just those 2 bytes fixed it.
+Disambiguated which byte is which by writing 2 uniforms + 0 settings via the
+compiled writer and checking which byte held 2. Both are now written
+correctly, and verified round-tripping a material with one of each through
+the real compiled reader gives back the exact original uniform and setting.
 
 Mesh.indices was previously a real gap in the Python surface, not the format:
 Geom.to_bytes() reads it, but Mesh only ever set the private `_indices` (via
@@ -539,17 +559,40 @@ class ShaderUniform:
 
 
 class ShaderSetting:
-    """Always empty on import (Material.settings stays `[]`) -- like Shader.name,
-    `ShaderSetting` has no field-level Python bindings anywhere in the compiled
-    module (only `__repr__`/`__init__`; exhaustive RTTI xref search found 31
-    other hits, all generic pybind11 vector/caster plumbing, never a
-    `parameter_name`/`value`/`unknown_0x12`-style getter). Also confirmed no
-    standalone `.material` file format exists (zero hits for that extension
-    string anywhere in the binary), so this isn't a separate file this parser
-    is simply missing -- real on-disk source (if any) not identified; left
-    unpopulated as the best-supported behavior rather than guessed at."""
+    """CORRECTION (this session, via Wine): an earlier pass concluded
+    ShaderSetting has no Python bindings at all in the compiled module --
+    that was wrong. `df.ShaderSetting()` has working `parameter_id`,
+    `parameter_name`, `value`, and `unknown_0x12` getters/setters (confirmed
+    by round-tripping real values through the compiled module directly), and
+    `parameter_id`/`parameter_name` validate against the SAME 791-entry
+    id<->name table as ShaderUniform (`_UNIFORM_ID_NAMES`/`_UNIFORM_NAME_IDS`
+    -- e.g. id 24 is "DiffuseColor" for both).
+
+    Real on-disk location, found this session: ShaderSetting records are NOT
+    a separate section -- they live in the exact same flat array of 32-byte
+    records as ShaderUniform, right after each material's 808-byte technique
+    block, indistinguishable in position or size from a uniform record. The
+    only difference is the record's `sub`-position field (offset +0x12,
+    called `unknown_0x12` here): for a uniform it's a small shape tag (0 =
+    texture, 1-4 = that many floats). For a setting it can be any other
+    value, and `value` there is 16 RAW bytes (not floats) -- offset +0x00 in
+    the record, same slot a uniform's float/texture-offset value occupies.
+    Confirmed via Wine: writing a ShaderSetting with parameter_id=30
+    ("SpecularPower"), unknown_0x12=4242 (0x1092 -- well outside the
+    uniform sub range), and an 8-byte value (zero-padded by the compiled
+    module to 16 on read back) via the compiled module's own to_file()
+    landed exactly there, immediately after a preceding real ShaderUniform
+    record in the same array, both terminated by the same 11-byte 0xFF
+    sentinel convention. This module's OWN reader previously (wrongly)
+    treated every sub value outside 1-4 as if it were a made-up "sub=100 2x
+    int32 render-state uniform" -- a convention this port invented, never
+    verified, and which silently swallowed and corrupted every real
+    ShaderSetting record on read as a bogus float uniform instead. See
+    Geom._read_uniforms_section / Geom.to_bytes' uniforms-section loop for
+    the fix."""
 
     def __init__(self):
+        self.parameter_id = 0
         self.parameter_name = ""
         self.value = b""
         self.unknown_0x12 = 0
@@ -1273,11 +1316,10 @@ class Geom:
         # material's record has been read (that section's start position depends
         # on ALL materials' geometry/attribute regions, not just this one's).
         mat.uniforms = []
-        # Real on-disk location of ShaderSetting data not identified this
-        # session -- left empty. Distinct from ShaderUniform (see
-        # _read_uniforms_section): settings appear to be a different, still-
-        # unlocated table (material.py's ShaderSetting has a raw-bytes `value`
-        # and `unknown_0x12`, unlike uniform's typed value shapes).
+        # Populated afterward by Geom._read_uniforms_section() alongside
+        # mat.uniforms -- see the ShaderSetting class docstring for how its
+        # real on-disk location (the same record array as ShaderUniform) was
+        # found this session.
         mat.settings = []
 
         # --- mesh geometry ---
@@ -1387,23 +1429,36 @@ class Geom:
                     break
 
                 uid, sub = struct.unpack_from("<HH", rec, 0x10)
-                uniform = ShaderUniform()
-                uniform.parameter_name = _UNIFORM_ID_NAMES.get(uid, f"unknown_uniform_{uid}")
 
                 if sub == 0:
+                    uniform = ShaderUniform()
+                    uniform.parameter_name = _UNIFORM_ID_NAMES.get(uid, f"unknown_uniform_{uid}")
                     reloff = struct.unpack_from("<i", rec, 0x00)[0]
                     extra = struct.unpack_from("<I", rec, 0x0C)[0]
                     uniform.uniform_type = "texture"
                     uniform.value = r.cstr(base_offset + extra_base + reloff)
                     uniform.unknown_0xC = extra
+                    mat.uniforms.append(uniform)
                 elif sub in (1, 2, 3, 4):
+                    uniform = ShaderUniform()
+                    uniform.parameter_name = _UNIFORM_ID_NAMES.get(uid, f"unknown_uniform_{uid}")
                     uniform.uniform_type = "float"
                     uniform.value = list(struct.unpack_from(f"<{sub}f", rec, 0x00))
+                    mat.uniforms.append(uniform)
                 else:
-                    uniform.uniform_type = "float"
-                    uniform.value = list(struct.unpack_from("<2i", rec, 0x00))
+                    # Not a recognized uniform shape tag -> a ShaderSetting
+                    # record instead, sharing this same record array/format
+                    # (see the ShaderSetting class docstring for how this was
+                    # found and verified). `sub` here is really
+                    # ShaderSetting.unknown_0x12; the value is 16 raw bytes,
+                    # not floats.
+                    setting = ShaderSetting()
+                    setting.parameter_id = uid
+                    setting.parameter_name = _UNIFORM_ID_NAMES.get(uid, f"unknown_setting_{uid}")
+                    setting.value = bytes(rec[0x00:0x10])
+                    setting.unknown_0x12 = sub
+                    mat.settings.append(setting)
 
-                mat.uniforms.append(uniform)
                 pos += cls._UNIFORM_RECORD_SIZE
 
     # -----------------------------------------------------------------------
@@ -1568,6 +1623,19 @@ class Geom:
             else:
                 header = bytearray(self._UNIFORM_SECTION_HEADER_BLOCK_SIZE)
             struct.pack_into("<I", header, 0x00, name_hash(mat.name))
+            # +0x320/+0x321 (u8 each): uniform_count / setting_count for the
+            # records immediately following this block. Gates whether
+            # Geom::ParseFromStream reads ANY of them at all -- confirmed by
+            # Wine differential testing: a file with correctly-written
+            # uniform/setting records but these two bytes left at 0 (this
+            # writer's previous behavior) made the real reader report 0
+            # uniforms AND 0 settings for that material, no error, silent.
+            # Patching just these 2 bytes in an otherwise-identical file
+            # made both come back correctly. Disambiguated which byte is
+            # which by writing 2 uniforms + 0 settings via the compiled
+            # writer and finding byte 0x320=2, 0x321=0.
+            header[0x320] = min(len(mat.uniforms), 255)
+            header[0x321] = min(len(mat.settings), 255)
             blobs.append((cursor, bytes(header)))
             cursor += len(header)
             for u in mat.uniforms:
@@ -1588,6 +1656,23 @@ class Geom:
                         v0, v1 = (int(vals[0]), int(vals[1])) if len(vals) >= 2 else (0, 0)
                         struct.pack_into("<2i", rec, 0x00, v0, v1)
                 struct.pack_into("<HH", rec, 0x10, uid, sub)
+                rec[0x14:0x1F] = b"\xFF" * 11
+                blobs.append((cursor, bytes(rec)))
+                cursor += 32
+
+            # ShaderSetting records -- same 32-byte format/array as the
+            # uniform records just above (see the ShaderSetting class
+            # docstring), just with a raw 16-byte value instead of floats
+            # and an arbitrary (non-1..4) unknown_0x12 instead of a uniform
+            # shape tag. Written directly after this material's uniforms,
+            # matching where Wine testing found them in a compiled-writer
+            # reference file.
+            for s in mat.settings:
+                rec = bytearray(32)
+                uid = _UNIFORM_NAME_IDS.get(s.parameter_name, int(s.parameter_id))
+                value_bytes = bytes(s.value)[:16].ljust(16, b"\x00")
+                rec[0x00:0x10] = value_bytes
+                struct.pack_into("<HH", rec, 0x10, uid, int(s.unknown_0x12))
                 rec[0x14:0x1F] = b"\xFF" * 11
                 blobs.append((cursor, bytes(rec)))
                 cursor += 32
