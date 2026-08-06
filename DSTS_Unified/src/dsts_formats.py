@@ -228,8 +228,26 @@ untouched original file first, in the same process, produces zero such
 warnings, so this is a real writer gap, not a Wine/runtime-context false
 alarm. Doesn't crash or corrupt anything Python-visible (uniform count,
 name, and value string all still come back correct), so it was left alone
-rather than guessed at -- next step for a future session: figure out what
-+0x0C actually addresses.
+rather than guessed at.
+
+Traced (not fully solved) via decompile: the message comes from
+sub_180026110, called from Geom_ParseFromStream at 0x1800246e2 with the
+result of sub_180025E40(uniform_name, r14, texture_name, material_name) --
+a trivial 4-pointer struct-packer, not the check itself. The "Length: "
+value printed is `*(uint32*)(r14+8)`. r14 at that point is NOT the 32-byte
+on-disk uniform record (confirmed: r14+0x12 is read as a u16 buffer-size/
+count just before, driving a realloc-and-copy loop unrelated to anything at
+on-disk +0xC) -- it's some other, not-yet-identified in-memory structure
+built earlier in the same per-material loop iteration, so "which on-disk
+field feeds it" is still open. What IS confirmed: this check is logged the
+same non-fatal way every other `_report()`-equivalent validation in this
+reader is (same global-error-list append call, sub_18004B520, seen
+throughout this session for every other soft validation failure) -- and
+empirically, in the round-trip test above, every uniform's name/value/count
+still came back exactly correct despite the warnings. Next step for a
+future session: trace r14's construction earlier in the same material-loop
+iteration (before offset ~1600 instructions into Geom_ParseFromStream) to
+find what on-disk field actually feeds it.
 """
 
 import os
