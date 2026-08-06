@@ -54,23 +54,56 @@ decompiled-code comment names it `var_6BA`/"header material count"). The
 writer never wrote it (left at 0), starving that loop and null-derefing
 downstream. Fixed in Geom.to_bytes() by writing material_count there too.
 
-Both fixes verified together against a real, non-trivial case (not just a
-bare skeleton): built a 2-bone skeleton + 1 material + 1 mesh (3 vertices,
-position attribute, triangle indices, 2-bone matrix_palette) with this
-pure-Python writer, loaded the result with the *real compiled* reader under
-Wine -- clean load, correct bone parent chain, correct vertex positions,
-correct indices, correct matrix_palette, empty error list
-(`set_throw_errors(False)`/`get_error_list()`).
+A follow-up session (still differential-Wine-testing against the compiled
+module's own writer) found and fixed three more, non-crashing bugs in the
+mesh/material record -- all three were previously undocumented fields this
+writer left at 0:
 
-One gap surfaced by that same test, NOT yet fixed: Mesh.name isn't actually
-persisted by this writer. Confirmed via the compiled module's own
-to_file()/from_file() that mesh name and material name round-trip as
-independent strings on a real file, but this writer never serializes a
-mesh-name table at all -- Mesh.from_bytes() only ever sets `mesh.name =
-mat.name` (mirrors the material's name) because the real per-mesh name
-storage location hasn't been located yet. Cosmetic, not a crash: unlike the
-two fixes above, a mesh built and exported by this writer will read back
-with the wrong displayed name but otherwise-correct geometry.
+- Mesh.name wasn't persisted at all. Turns out mesh name is NOT part of the
+  bone/material name-table mechanism; it lives directly in the per-mesh
+  128-byte record: +0x34 (u32) is the mesh's own name_hash, +0x38 (i64) is
+  its pool-relative name string offset. Found by building two meshes with
+  different-length names via the compiled writer and diffing raw bytes --
+  both fields tracked mesh.name exactly (e.g. a mesh named "BBBBBBBB" landed
+  +0x38=6, matching that string's own pool offset). The previous code wrote
+  the co-located *material's* name/hash into these two fields instead, which
+  is why a written-and-reread mesh always came back with the material's name.
+
+- Material.name wasn't persisted either, despite the material_name_table
+  pool mechanism (header TOC's count_b/ptr_b) being correctly populated the
+  whole time. Confirmed by corrupting only the material_name_table's string
+  bytes in an otherwise-working compiled-writer file: Material.name came
+  back as an empty string rather than the corrupted text, proving it isn't
+  read via that pointer directly. It's resolved by a hash check instead: the
+  per-material 808-byte "shader technique" block's first 4 bytes are
+  Material.name_hash (already known), and Geom::ParseFromStream seekg's to
+  an ABSOLUTE position -- header +0x50 (i64), a field this writer never
+  wrote either -- immediately before reading that block sequentially per
+  material. Confirmed by locating name_hash("matAAAA") in a compiled
+  reference file's raw bytes and finding the identical value already
+  sitting in the header at that exact offset. Both are now written:
+  name_hash(mat.name) into the technique block, and the section's real
+  cursor position into header+0x50.
+
+- Even with both of the above fixed, a SECOND material (mesh index > 0)
+  still resolved to the WRONG material. Root cause: record +0x40 (u32) is a
+  material-index field selecting which technique-section entry (the one
+  anchored by header+0x50) this mesh's material actually is -- it's not
+  implied by the 1:1 array-position pairing between mesh and material
+  records elsewhere in this format. Confirmed by forcing this field to 0 in
+  an otherwise-correct 2-material compiled-writer file: the second mesh's
+  material silently resolved to the first material's name instead -- the
+  exact symptom this writer produced (every mesh past the first bound to
+  materials[0]) before this field was written as the mesh's own loop index.
+
+All fixes verified together against real, non-trivial cases (not just a
+bare skeleton): a 2-bone skeleton + 1 material + 1 mesh, and separately a
+1-bone skeleton + 2 independent meshes each with their own distinctly-named
+material, both built with this pure-Python writer and loaded with the *real
+compiled* reader under Wine -- clean load, correct bone parent chain,
+correct vertex positions/indices/matrix_palette, correct and DISTINCT mesh
+and material names per mesh, empty error list
+(`set_throw_errors(False)`/`get_error_list()`).
 
 The skeleton table's by-name-hash lookup sub-table -- flagged in an earlier
 pass as "only its SIZE formula was ground-truthed, content zero-filled" -- has
@@ -1356,6 +1389,11 @@ class Geom:
         pool = _StringPool()
         bone_name_rel = [pool.add(b.name) for b in self.skeleton.bones]
         material_name_rel = [pool.add(m.name) for m in self.materials]
+        # Mesh names are NOT part of the bone/material name-table mechanism
+        # -- they're stored per-mesh-record instead (see the +0x34/+0x38
+        # comment in the mesh-record write loop below) -- but still need a
+        # slot in the same shared string pool.
+        mesh_name_rel = [pool.add(m.name) for m in self.meshes]
         for mat in self.materials:
             for u in mat.uniforms:
                 if u.uniform_type == "texture":
@@ -1426,12 +1464,45 @@ class Geom:
             })
 
         # Uniforms section: material_count x [808-byte header block (shader
-        # technique -- zero-filled, see class docstring above) + one 32-byte
-        # record per uniform].
+        # technique -- mostly zero-filled/not reverse-engineered, see class
+        # docstring above, EXCEPT its first 4 bytes) + one 32-byte record
+        # per uniform.
+        #
+        # The first 4 bytes of that 808-byte block are Material.name_hash
+        # (already known -- see the class docstring). What was NOT known
+        # until this session: Material.name (the STRING) is not read
+        # directly from the material_name_table pool entry -- it's resolved
+        # by looking up the pool string whose hash matches this stored
+        # name_hash. Confirmed by Wine differential testing: corrupting only
+        # the material_name_table's string bytes in a real, working
+        # compiled-writer-produced file (leaving the technique block's
+        # stored hash untouched) made Material.name come back as an empty
+        # string on read, even though the material_name_table pointer/
+        # string-pool plumbing was otherwise byte-identical to a working
+        # file. This writer previously left the whole 808-byte block zero,
+        # so name_hash was always 0 -- which essentially never matches
+        # hash(mat.name), so every written material's name silently came
+        # back empty on reread even though the name string itself was
+        # correctly present in the pool.
+        # header +0x50 (i64): absolute offset of this whole section.
+        # Geom::ParseFromStream seekg's here (r14 + var_670, where var_670 is
+        # this field) immediately before its per-material technique/uniform
+        # read loop -- those reads are NOT sequential-continuation-from-
+        # wherever-the-stream-was, as an earlier pass through this code
+        # assumed; they're anchored by this field. Never written before this
+        # fix (left at 0), so the real reader's seekg landed near the start
+        # of the file instead of here, reading header bytes as if they were
+        # technique-block data -- garbage name_hash, hence material.name
+        # coming back empty even once the hash-write fix above was in place.
+        # Found by locating name_hash("matAAAA") in a compiled-writer
+        # reference file's raw bytes and finding the same value already
+        # sitting in the header at this exact offset.
         cursor = _align(cursor, 8)
+        uniforms_section_offset = cursor
         for mat in self.materials:
-            header = bytes(self._UNIFORM_SECTION_HEADER_BLOCK_SIZE)
-            blobs.append((cursor, header))
+            header = bytearray(self._UNIFORM_SECTION_HEADER_BLOCK_SIZE)
+            struct.pack_into("<I", header, 0x00, name_hash(mat.name))
+            blobs.append((cursor, bytes(header)))
             cursor += len(header)
             for u in mat.uniforms:
                 rec = bytearray(32)
@@ -1592,6 +1663,7 @@ class Geom:
         struct.pack_into("<I", header, 0x30, self.unknown_0x30)
         struct.pack_into("<I", header, 0x34, self.unknown_0x34)
         struct.pack_into("<q", header, 0x48, materials_array_offset)
+        struct.pack_into("<q", header, 0x50, uniforms_section_offset)
         struct.pack_into("<q", header, 0x68, second_xform_pos)
         struct.pack_into("<q", header, 0x78, extra_base)
         struct.pack_into("<q", header, 0x90, toc_offset)
@@ -1621,8 +1693,29 @@ class Geom:
             flags = [mesh.flag_0, mesh.flag_1, mesh.flag_2, mesh.flag_3,
                      mesh.flag_4, mesh.flag_5, mesh.flag_6, mesh.flag_7]
             r[0x31] = sum((1 << bit) for bit, f in enumerate(flags) if f)
-            struct.pack_into("<I", r, 0x34, name_hash(mat.name))
-            struct.pack_into("<q", r, 0x38, material_name_rel[i])
+            # +0x34/+0x38 (name_hash/pool-relative-name-offset) hold the
+            # MESH's own name, not the material's -- confirmed by Wine
+            # differential testing against the compiled writer: building two
+            # meshes with different-length names and diffing the raw bytes
+            # showed these two fields track mesh.name exactly (e.g. a mesh
+            # named "BBBBBBBB" landed +0x38=6, matching that string's own
+            # pool offset, not the co-located material's). The previous code
+            # wrote the material's name/hash here instead, which is why a
+            # written-and-reread mesh came back with the material's name.
+            struct.pack_into("<I", r, 0x34, name_hash(mesh.name))
+            struct.pack_into("<q", r, 0x38, mesh_name_rel[i])
+            # +0x40 (u32): this record's material index -- i.e. which entry
+            # in the per-material technique/uniform section (header +0x50)
+            # this mesh's material resolves to. NOT implied by array
+            # position despite the 1:1 mesh<->material record pairing
+            # elsewhere in this format. Confirmed by Wine differential
+            # testing: forcing this field to 0 in an otherwise-correct,
+            # 2-material compiled-writer reference file made the second
+            # mesh's material silently resolve to the first material instead
+            # -- exactly the symptom this writer produced before this field
+            # was ever written (always left at 0, so every mesh but the
+            # first bound to the wrong material).
+            struct.pack_into("<I", r, 0x40, i)
             struct.pack_into("<I", r, 0x44, rec["vertex_count"])
             struct.pack_into("<I", r, 0x48, rec["index_count"])
             off = materials_array_offset + i * 128
