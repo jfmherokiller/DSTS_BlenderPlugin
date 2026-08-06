@@ -124,10 +124,35 @@ what it actually holds (a precomputed world-inverse matrix per bone, not a
 duplicate of the raw transform) and how the resulting crash was root-caused
 and fixed.
 
-The per-material "shader technique" block (Material.shaders[i].name):
-confirmed real, non-empty, Python-settable data with some ~56-byte-per-shader
-custom encoding, not reverse-engineered. ShaderSetting data's real on-disk
-location also still isn't known (settings stay empty on both read and write).
+The per-material 808-byte "shader technique" block (Material.shaders[i].name
+lives somewhere in here, ~56-byte-per-shader, per the Shader class docstring)
+still isn't independently decoded, and there's still no Python-level way to
+construct valid technique data from scratch for a brand-new material -- that
+part is unchanged, and matches the compiled module's own Python surface
+(Shader has no exposed name getter/setter there either, so this isn't behind
+it). What IS fixed: this writer now finds the section via header +0x50 (see
+above) instead of a heuristic, and Material._read_uniforms_section() /
+Geom.to_bytes() capture and reuse a read material's original 808-byte block
+verbatim (patching only the name_hash) instead of discarding it -- so
+importing a real asset, editing meshes/skeleton/materials-by-name, and
+re-exporting now preserves each material's real in-game shading data, which
+previously silently reverted to zero-filled (effectively broken) on every
+export regardless of whether the material was actually touched. Verified:
+write -> read back with this module's own reader -> rename the material ->
+write again -> the technique block's bytes past the first 4 are byte-
+identical between the two writes, and the *real compiled* reader resolves
+the renamed material's name correctly from the second file.
+
+ShaderSetting data's real on-disk location also still isn't known (settings
+stay empty on both read and write).
+
+Mesh.indices was previously a real gap in the Python surface, not the format:
+Geom.to_bytes() reads it, but Mesh only ever set the private `_indices` (via
+from_bytes() on read, or mesh.py explicitly on export) -- a mesh read from a
+file and re-exported without mesh.py re-touching indices raised
+AttributeError. Fixed by making `.indices` a property backed by `_indices`,
+matching the compiled module's own Mesh (there, `.indices` is directly
+settable, confirmed by construction via its Python API).
 """
 
 import os
@@ -563,6 +588,14 @@ class Material:
         self.unknown_0x31C = 0
         self.unknown_0x324 = 0
         self.unknown_0x326 = 0
+        # Raw 808-byte "shader technique" block (see _read_uniforms_section /
+        # to_bytes' uniforms-section comments), captured verbatim on read so
+        # a read-modify-write round trip preserves whatever real in-game
+        # shading data it holds even though nothing in this class's Python
+        # surface can decode or re-derive it. None for a material built
+        # fresh via the Python API (nothing to preserve) -- the writer
+        # falls back to a zero-filled block in that case, same as before.
+        self._technique_raw = None
 
     @property
     def name(self):
@@ -741,6 +774,22 @@ class Mesh:
     def get_indices(self):
         """Flat triangle-list indices (already strip-expanded at load time)."""
         return list(self._indices)
+
+    @property
+    def indices(self):
+        """Same data as get_indices(), as a plain settable attribute --
+        matches the compiled module's own Mesh.indices surface (confirmed:
+        it's directly settable there, e.g. `mesh.indices = [0, 1, 2]`, not
+        just gettable via a get_indices()-style method), and is what
+        Geom.to_bytes() reads from. Backed by the same _indices this class's
+        own from_bytes() populates, so a mesh read from a file and then
+        written back out (even without mesh.py explicitly re-setting
+        indices) round-trips instead of raising AttributeError."""
+        return list(self._indices)
+
+    @indices.setter
+    def indices(self, value):
+        self._indices = list(value)
 
     def set_vertex_count(self, count):
         self._vertex_count = int(count)
@@ -1286,12 +1335,16 @@ class Geom:
         `[808-byte header block][variable-count 32-byte uniform record]` groups,
         one per material in index order.
 
-        The section's start offset isn't stored anywhere as an explicit field --
-        it's implicitly wherever the sequential writer left off, which empirically
-        equals `max(end offset of every region any material points into)` across
-        ALL materials (verified byte-exact against a real chr090.geom: predicted
-        0x21aec0 from this formula matches the real end of material 5's mesh-
-        attribute table exactly, off by 0 bytes).
+        The section's start offset WAS thought to not be stored anywhere as an
+        explicit field -- estimated instead as `max(end offset of every region
+        any material points into)` across ALL materials (verified byte-exact
+        against a real chr090.geom this way: predicted 0x21aec0 matched the
+        real end of material 5's mesh-attribute table exactly). A later
+        session (see Geom.to_bytes' uniforms-section comment) found the real
+        field: header +0x50 (i64), the same one Geom::ParseFromStream itself
+        seekg's to before this section's sequential reads. Preferred now;
+        the max-end estimate is kept only as a fallback for header+0x50==0
+        (e.g. a from-scratch materials array with nothing to point past).
 
         Each uniform record has no explicit type tag beyond a `sub` field that
         selects the value's shape (0 = texture reference, 1-4 = that many packed
@@ -1323,8 +1376,10 @@ class Geom:
             )
             max_end = max(max_end, *ends)
 
-        pos = base_offset + max_end
+        uniforms_section_offset = r.i64(base_offset + 0x50)
+        pos = base_offset + (uniforms_section_offset if uniforms_section_offset else max_end)
         for mat in materials:
+            mat._technique_raw = bytes(r.data[pos:pos + cls._UNIFORM_SECTION_HEADER_BLOCK_SIZE])
             pos += cls._UNIFORM_SECTION_HEADER_BLOCK_SIZE
             while pos + cls._UNIFORM_RECORD_SIZE <= len(r.data):
                 rec = r.data[pos:pos + cls._UNIFORM_RECORD_SIZE]
@@ -1500,7 +1555,18 @@ class Geom:
         cursor = _align(cursor, 8)
         uniforms_section_offset = cursor
         for mat in self.materials:
-            header = bytearray(self._UNIFORM_SECTION_HEADER_BLOCK_SIZE)
+            # If this material came from reading a real file, reuse its
+            # original 808-byte technique block verbatim (see Material.
+            # _technique_raw and _read_uniforms_section) instead of zero-
+            # filling -- preserves whatever real in-game shading data it
+            # holds (Shader.name etc, still not independently decoded/
+            # settable from Python -- see the Shader class docstring) through
+            # a read-modify-write round trip. Only the name_hash needs
+            # patching, since Material.name may have changed since read.
+            if mat._technique_raw is not None:
+                header = bytearray(mat._technique_raw)
+            else:
+                header = bytearray(self._UNIFORM_SECTION_HEADER_BLOCK_SIZE)
             struct.pack_into("<I", header, 0x00, name_hash(mat.name))
             blobs.append((cursor, bytes(header)))
             cursor += len(header)
