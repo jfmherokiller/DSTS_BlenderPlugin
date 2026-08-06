@@ -25,10 +25,52 @@ Writing (Geom.to_bytes()/to_file(), Mesh.set_*()) is also implemented, and
 round-trips correctly through this same reader (verified against a real,
 25-bone/6-material chr050.geom, byte-exact vertex data) and through the full
 Blender addon export pipeline (verified end-to-end: import real game asset,
-export via the addon's real operator, re-import, compare). BUT a file this
-writer produces is NOT YET SAFE to load in the actual game or the real compiled
-module: confirmed (via Wine) that the real reader still crashes on writer
-output, even for a minimal synthetic file.
+export via the addon's real operator, re-import, compare).
+
+The "Matrix is singular and cannot be inverted!" crash that used to block
+every writer-produced file with a real bone hierarchy (see git history for
+the previous, now-resolved account of that investigation) was root-caused
+and fixed this session by differential Wine testing: built the same 3-bone
+parent chain two ways -- once with this pure-Python writer, once with the
+*compiled* module's own Bone/Skeleton/Geom API and to_file() -- and diffed
+the raw bytes at the Geom-level "second BoneTransform array" (header +0x0C
+count, +0x68 absolute position). It is NOT a duplicate of the raw
+quaternion/position/scale struct (the previous, wrong assumption); it holds
+each bone's precomputed WORLD-SPACE INVERSE matrix (3 rows x 4 floats,
+row-major, translation in column 3), which Geom::ParseFromStream recomputes
+live from the skeleton table (walking Bone.parent, composing local
+matrices, inverting) and cross-checks entry-by-entry. Writing raw transform
+floats there instead of an actual inverted matrix is what produced a
+degenerate (all-zero-row) "matrix" and the divide-by-zero-adjacent singular
+crash. _write_skeleton_table's neighboring comment on `second_xform_pos` has
+the exact layout and the confirming byte dump.
+
+A second, independent crash (null-pointer, not the singular-matrix one) was
+found and fixed the same way once a real mesh+material was added to the
+Wine differential test: header +0x06 (u16) is a SECOND material-count field,
+distinct from the already-validated one at +0x04, gating the per-material
+shader/uniform-technique loop in Geom::ParseFromStream (an existing
+decompiled-code comment names it `var_6BA`/"header material count"). The
+writer never wrote it (left at 0), starving that loop and null-derefing
+downstream. Fixed in Geom.to_bytes() by writing material_count there too.
+
+Both fixes verified together against a real, non-trivial case (not just a
+bare skeleton): built a 2-bone skeleton + 1 material + 1 mesh (3 vertices,
+position attribute, triangle indices, 2-bone matrix_palette) with this
+pure-Python writer, loaded the result with the *real compiled* reader under
+Wine -- clean load, correct bone parent chain, correct vertex positions,
+correct indices, correct matrix_palette, empty error list
+(`set_throw_errors(False)`/`get_error_list()`).
+
+One gap surfaced by that same test, NOT yet fixed: Mesh.name isn't actually
+persisted by this writer. Confirmed via the compiled module's own
+to_file()/from_file() that mesh name and material name round-trip as
+independent strings on a real file, but this writer never serializes a
+mesh-name table at all -- Mesh.from_bytes() only ever sets `mesh.name =
+mat.name` (mirrors the material's name) because the real per-mesh name
+storage location hasn't been located yet. Cosmetic, not a crash: unlike the
+two fixes above, a mesh built and exported by this writer will read back
+with the wrong displayed name but otherwise-correct geometry.
 
 The skeleton table's by-name-hash lookup sub-table -- flagged in an earlier
 pass as "only its SIZE formula was ground-truthed, content zero-filled" -- has
@@ -41,27 +83,13 @@ implementation comment for the exact formulas) followed by a fixed-position
 (header+0x40) array of (u16 bone_index, u16 parent_index-or-0x7FFF) pairs --
 the real on-disk parent-hierarchy encoding, previously thought to only live in
 the companion .nlst. This is implemented and produces a correct parent chain
-when read back (verified). A second, separate "Geom-level" duplicate
-BoneTransform array (header +0x0C count, +0x68 absolute position),
-independently read and cross-checked by Geom::ParseFromStream against the
-Skeleton's own copy, was also discovered and is implemented (a byte-identical
-duplicate).
-
-Both of those were confirmed via Wine to get the real reader measurably
-further (each fix moved the crash to a distinct, later address in the real
-binary) before hitting the CURRENT blocker: once real parent links are
-present, the real reader computes each bone's composed world-space transform
-(Bone-local-matrix, multiplied by the parent's own composed matrix when a
-parent exists) and unconditionally inverts it -- and prints "Matrix is
-singular and cannot be inverted!" for nearly every bone before crashing. The
-per-bone quaternion/position/scale data going in is confirmed valid (a
-rotation+unit-scale+translation matrix is never singular), so this is most
-likely an ordering/caching requirement in how the real function expects
-composed parent transforms to already be available when a child is processed,
-not a data-correctness problem -- not yet root-caused this session (next step:
-decompile the callers of sub_1800174C0/sub_180014EA0 in
-Geom_ParseFromStream to find what supplies the "already composed" parent
-matrix and how it's populated/ordered).
+when read back (verified). A second, separate "Geom-level" array (header
++0x0C count, +0x68 absolute position), independently read and cross-checked
+by Geom::ParseFromStream against a live recomputation from the Skeleton's
+own copy, was also discovered -- see the writer/blocker paragraph above for
+what it actually holds (a precomputed world-inverse matrix per bone, not a
+duplicate of the raw transform) and how the resulting crash was root-caused
+and fixed.
 
 The per-material "shader technique" block (Material.shaders[i].name):
 confirmed real, non-empty, Python-settable data with some ~56-byte-per-shader
@@ -1506,18 +1534,40 @@ class Geom:
         blobs.append((skeleton_table_offset + v15_rel_pos, bytes(v15)))
         cursor = skeleton_table_offset + skel_table_total
 
-        # Geom-level header carries its OWN separate copy of the
-        # BoneTransform array (header +0x0C u16 count, +0x68 i64 absolute
-        # position) that Geom::ParseFromStream reads independently of
-        # Skeleton::ReadFromStream and cross-checks against it (count must
-        # match, then a per-component float-equality loop, tolerance
-        # 0.0001) -- confirmed by decompiling Geom_ParseFromStream itself
-        # (not just the writer, and not just Skeleton::ReadFromStream) after
-        # a real crash showed this second, previously-undiscovered read.
-        # Simplest correct fix: write byte-identical duplicate content.
+        # Geom-level header carries a SECOND array (header +0x0C u32 count,
+        # +0x68 i64 absolute position) that Geom::ParseFromStream reads
+        # independently of Skeleton::ReadFromStream. Previously assumed to be
+        # a byte-identical duplicate of the raw BoneTransform (quat/pos/
+        # scale) array -- that was WRONG and is what caused the "Matrix is
+        # singular and cannot be inverted!" crash this module's docstring
+        # used to describe as unsolved. Root-caused by differential Wine
+        # testing: built the same 3-bone parent chain with the *compiled*
+        # module's own Bone/Skeleton/Geom API and to_file(), then hex-dumped
+        # the bytes at this array's real on-disk location. They are NOT
+        # quat/pos/scale floats -- they're each bone's precomputed WORLD-
+        # SPACE INVERSE matrix (bind-pose inverse): 3 rows x 4 floats each
+        # (48 bytes/bone, row-major, translation in column 3, 4th row
+        # omitted/implicit [0,0,0,1] -- the same layout the reader's own
+        # matrix builder, sub_180017120, produces). Confirmed against the
+        # dump: a child bone at local position (0,1,0) with an identity-
+        # transform root parent produced rows (1,0,0,0)/(0,1,0,-1)/(0,0,1,0)
+        # -- exactly inverse-translate(0,1,0), byte-for-byte.
+        # Geom_ParseFromStream recomputes this same matrix live from the
+        # skeleton table's parent-linked transforms (walking Bone.parent,
+        # composing local matrices, then inverting -- sub_1800174C0) and
+        # compares it against this array entry-by-entry (tolerance 0.0001)
+        # for every non-geometry bone. Writing raw quat/pos/scale floats
+        # here instead of a real inverted matrix meant the "matrix" being
+        # validated/consumed was nonsense with an all-zero row -- hence the
+        # singular-matrix determinant-zero crash on nearly every bone.
         second_xform_pos = _align(cursor, 8)
-        blobs.append((second_xform_pos, bytes(xform_blob)))
-        cursor = second_xform_pos + len(xform_blob)
+        world_inv_blob = bytearray(bone_count * 48)
+        for i, b in enumerate(self.skeleton.bones):
+            m = b.transform_actual.inverted()
+            rows = [m[r][c] for r in range(3) for c in range(4)]
+            struct.pack_into("<12f", world_inv_blob, i * 48, *rows)
+        blobs.append((second_xform_pos, bytes(world_inv_blob)))
+        cursor = second_xform_pos + len(world_inv_blob)
 
         total_size = cursor
         buf = bytearray(total_size)
@@ -1527,6 +1577,16 @@ class Geom:
         header = bytearray(168)
         struct.pack_into("<I", header, 0x00, 316)
         struct.pack_into("<H", header, 0x04, material_count)
+        # +0x06 u16: a SECOND material-count field, independent of +0x04's
+        # (already-validated-against-a-real-file) value. Confirmed by a
+        # decompiled-code comment on Geom_ParseFromStream's per-material
+        # shader/uniform-technique loop (var_6BA, gates that loop's r13w
+        # iteration count) from an earlier RE session. Never written before
+        # this fix -- left at 0, which starved that loop and was the direct
+        # cause of a null-pointer crash in the real reader on any file with
+        # a real material (reproduced and root-caused via Wine differential
+        # testing against the compiled writer this session).
+        struct.pack_into("<H", header, 0x06, material_count)
         struct.pack_into("<H", header, 0x0C, bone_count)
         struct.pack_into("<I", header, 0x10, self.unknown_0x10)
         struct.pack_into("<I", header, 0x30, self.unknown_0x30)
