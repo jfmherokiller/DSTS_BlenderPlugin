@@ -173,6 +173,18 @@ file and re-exported without mesh.py re-touching indices raised
 AttributeError. Fixed by making `.indices` a property backed by `_indices`,
 matching the compiled module's own Mesh (there, `.indices` is directly
 settable, confirmed by construction via its Python API).
+
+Each material/mesh record's +0x50..+0x70 (8 floats, previously always
+zero-filled) is per-mesh bounding data -- radius, AABB center xyz, AABB
+half-extent xyz (see _mesh_bounds' docstring for the exact layout and how it
+was found: diffing compiled-writer output for meshes with deliberately
+different, fully asymmetric geometry against their known vertex positions,
+3-for-3 exact matches). Never touched by anything this module's own
+read-path validation exercises -- every prior round-trip test passed with
+it at all-zero -- so this is presumably runtime culling data the game reads
+directly, silently wrong (a degenerate zero-radius/zero-extent bound) for
+every mesh this writer ever produced. Now computed from the mesh's own
+vertex positions and written for real.
 """
 
 import os
@@ -700,6 +712,48 @@ def _trilist_to_tristrip(indices):
         else:
             out.extend((a, b, c))
     return out
+
+
+def _mesh_bounds(vbuf, mesh):
+    """Returns (radius, center.x/y/z, half_extent.x/y/z) -- 7 floats -- from
+    the mesh's own packed position data. Written into the material/mesh
+    record at +0x54..+0x6C (a leading +0x50 float, always 0 in every sample
+    this was checked against, is left alone/zero -- not part of this).
+
+    Found via Wine differential testing against the compiled writer: built
+    meshes with deliberately different geometry (a tiny triangle near the
+    origin, a unit triangle, and a large triangle far from the origin with
+    fully asymmetric extents) and diffed the resulting material record
+    bytes at this offset against each mesh's known vertex positions. All
+    three matched exactly: +0x54 = sqrt(ex^2+ey^2+ez^2) (bounding-sphere-ish
+    radius from the AABB half-extent), +0x58/+0x5c/+0x60 = AABB center
+    x/y/z, +0x64/+0x68/+0x6c = AABB half-extent x/y/z. This writer
+    previously always left all 8 floats at 0 -- structurally harmless (every
+    read-back test that mattered for object-graph correctness passed
+    regardless, since nothing in Geom::ParseFromStream's parsing/validation
+    path touches this data), but it's real, computable per-mesh bounding
+    data the game likely uses for runtime culling, silently wrong for every
+    mesh this writer ever produced. Only handles a "position" attribute with
+    dtype "float" (the overwhelmingly common case); anything else falls back
+    to all-zero exactly as before rather than guessing at other encodings.
+    """
+    pos_attr = next((a for a in mesh.mesh_attributes if a.atype == "position"), None)
+    stride = mesh.bytes_per_vertex
+    if pos_attr is None or not stride or pos_attr.dtype != "float":
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    n = len(vbuf) // stride
+    if n == 0:
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    xs, ys, zs = [], [], []
+    for i in range(n):
+        x, y, z = struct.unpack_from("<3f", vbuf, i * stride + pos_attr.offset)
+        xs.append(x)
+        ys.append(y)
+        zs.append(z)
+    cx, cy, cz = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, (min(zs) + max(zs)) / 2
+    ex, ey, ez = (max(xs) - min(xs)) / 2, (max(ys) - min(ys)) / 2, (max(zs) - min(zs)) / 2
+    radius = (ex * ex + ey * ey + ez * ez) ** 0.5
+    return (radius, cx, cy, cz, ex, ey, ez)
 
 
 # atype -> on-disk channel ordinal, for exporting mesh_attributes. Reverse of
@@ -1520,6 +1574,7 @@ class Geom:
 
         for mesh, mat in zip(self.meshes, self.materials):
             vbuf = mesh.pack_vertices()[2]
+            bounds = _mesh_bounds(vbuf, mesh)
             # Authoritative vertex count is the packed buffer's own length,
             # not mesh._vertex_count -- that field is only ever populated by
             # set_vertex_count() (the fresh-construction/export path); a mesh
@@ -1571,6 +1626,7 @@ class Geom:
                 "bone_indices_offset": bone_indices_offset, "mesh_attrs_offset": mesh_attrs_offset,
                 "vertex_count": vertex_count, "index_count": len(strip),
                 "bone_index_count": len(bone_idx_list), "attr_count": len(mesh.mesh_attributes),
+                "bounds": bounds,
             })
 
         # Uniforms section: material_count x [808-byte header block (shader
@@ -1869,6 +1925,10 @@ class Geom:
             struct.pack_into("<I", r, 0x40, i)
             struct.pack_into("<I", r, 0x44, rec["vertex_count"])
             struct.pack_into("<I", r, 0x48, rec["index_count"])
+            # +0x54..+0x6C: per-mesh bounds (radius, AABB center, AABB
+            # half-extent), computed from this mesh's own vertex positions --
+            # see _mesh_bounds' docstring for how this was found/verified.
+            struct.pack_into("<7f", r, 0x54, *rec["bounds"])
             off = materials_array_offset + i * 128
             buf[off:off + 128] = r
 
