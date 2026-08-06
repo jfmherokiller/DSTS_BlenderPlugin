@@ -185,6 +185,51 @@ it at all-zero -- so this is presumably runtime culling data the game reads
 directly, silently wrong (a degenerate zero-radius/zero-extent bound) for
 every mesh this writer ever produced. Now computed from the mesh's own
 vertex positions and written for real.
+
+Everything above was validated only against this module's own synthetic
+test files until this session got access to a real shipped asset
+(chr050.geom, Agumon, extracted from the actual game's app_0.dx11.mvgl via
+DSCSToolsCLI --extractFile "chr050.geom" -- .geom files sit at the archive
+root, not under any chara/model/-style subfolder, confirmed by grepping
+NewDigimon mod metadata for its bundled cam_*.geom replacement paths). That
+surfaced one more real bug, now fixed, and one still open:
+
+FIXED: Material.name was read from the same +0x34/+0x38 fields this session
+already found belong to the mesh (see above), and a same-array-position
+fallback to the TOC's material name list when that came up empty -- both
+wrong for a real file. Reading chr050.geom gave "chr050" (actually the
+mesh's name) for all 3 body materials instead of their real, distinct names
+"chr050_b01"/"chr050_f01"/"chr050_f02". Confirmed the TOC's material name
+list isn't even in the same order as the material/mesh record array for a
+real file (list: f01, f02, eye_R, b01, eye_L, line01; records: b01, f01,
+f02, eye_L, eye_R, line01), so position-based resolution can't work at all
+-- Material.name has to be resolved the same way the writer already treats
+it (see the technique-block paragraphs above): each record's technique
+block stores name_hash(material_name) in its first 4 bytes, and the real
+name is whichever TOC name-list entry hashes to that value. Fixed in
+Geom.from_bytes(); verified both against chr050.geom directly (exact name,
+order, and uniform/setting-count match against the real compiled reader)
+and end-to-end (read chr050.geom with this module, write it back out, load
+THAT with the real compiled reader -- identical bones/materials/meshes/
+names/uniforms/settings).
+
+STILL OPEN: that same end-to-end round-trip logs real-reader warnings
+("Texture name does not match length") for every texture-type ShaderUniform
+carried over from the original file. ShaderUniform.unknown_0xC (the 32-bit
+field at each texture uniform record's +0x0C, e.g. 468105) is preserved
+verbatim by this writer, but it is NOT a string length or anything else
+this session could identify by relative position against known offsets
+(uniforms-section start, extra_base, material record, or the referenced
+texture's own vertex/index buffers were all checked -- no clean
+relationship). Whatever table or field it actually references, blindly
+copying its old value into a differently-laid-out output file breaks
+whatever validation the real reader performs against it -- reading the
+untouched original file first, in the same process, produces zero such
+warnings, so this is a real writer gap, not a Wine/runtime-context false
+alarm. Doesn't crash or corrupt anything Python-visible (uniform count,
+name, and value string all still come back correct), so it was left alone
+rather than guessed at -- next step for a future session: figure out what
++0x0C actually addresses.
 """
 
 import os
@@ -1170,10 +1215,6 @@ class Geom:
         for i in range(material_count):
             rec = record_base + i * 128
             mat, mesh = cls._read_material_and_mesh_record(r, base_offset, rec, extra_base)
-            if mat.name == "" and i < len(material_names):
-                mat.name = material_names[i]
-            mesh.name = mat.name
-            mesh.name_hash = name_hash(mat.name)
             mesh.material = mat
             mesh.matrix_palette = [
                 geom.skeleton.bones[idx]
@@ -1186,6 +1227,25 @@ class Geom:
         cls._read_uniforms_section(
             r, base_offset, extra_base, materials_array_offset, material_count, geom.materials
         )
+
+        # Material.name is resolved AFTER the technique block is read (just
+        # above), by hash -- NOT from material_names[i] by array position.
+        # Confirmed against a real chr050.geom: the TOC's material name list
+        # is in a different order than the material/mesh record array (e.g.
+        # material_names = [f01, f02, eye_R, b01, eye_L, line01] while the
+        # record array order is [b01, f01, f02, eye_L, eye_R, line01]) -- so
+        # each material's real name has to be found by matching
+        # name_hash(candidate) against the name_hash the technique block's
+        # first 4 bytes actually store for THAT record, not assumed from
+        # position. (Also confirmed this is the same mechanism the writer
+        # depends on -- see Geom.to_bytes' technique-block comment -- and
+        # the same one a corrupt-the-string-but-not-the-hash Wine test
+        # showed the real reader uses for round-tripping this writer's own
+        # output.)
+        name_by_hash = {name_hash(n): n for n in material_names}
+        for mat in geom.materials:
+            stored_hash = struct.unpack_from("<I", mat._technique_raw, 0)[0] if mat._technique_raw else 0
+            mat.name = name_by_hash.get(stored_hash, f"unknown_material_{stored_hash:08x}")
 
         return geom
 
@@ -1339,10 +1399,19 @@ class Geom:
         mat = Material()
         mesh = Mesh()
 
-        mat.name_hash = r.u32(rec + 0x34)
+        # +0x34/+0x38 are the MESH's own name_hash/pool-relative name offset,
+        # not the material's -- confirmed this session both by writing them
+        # (see Geom.to_bytes' comment on this same pair of fields) and now
+        # by reading a real chr050.geom, where trusting these for
+        # Material.name gave back the mesh's name instead (repeated
+        # "chr050" for all 3 body materials, instead of their real distinct
+        # names "chr050_b01"/"chr050_f01"/"chr050_f02"). Material.name is
+        # resolved separately, after the technique block is read -- see the
+        # from_bytes() caller for the hash-lookup fix.
+        mesh.name_hash = r.u32(rec + 0x34)
         name_rel_offset = r.i64(rec + 0x38)
         if name_rel_offset:
-            mat.name = r.cstr(base_offset + extra_base + name_rel_offset)
+            mesh.name = r.cstr(base_offset + extra_base + name_rel_offset)
 
         flags_byte = r.data[rec + 0x31]
         flag_bits = [bool((flags_byte >> b) & 1) for b in range(8)]
